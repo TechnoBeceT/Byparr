@@ -1,13 +1,18 @@
+import logging
 from http import HTTPStatus
+from io import StringIO
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from starlette.testclient import TestClient
 
 from main import app
 from src.owui import LoadRequest, load_urls
 from src.utils import BrowserDepClass
+from src.utils import logger as production_logger
 
 client = TestClient(app)
 
@@ -113,3 +118,61 @@ async def test_extraction_falls_back_to_innertext():
         fake_dep(html="<html><body></body></html>"),
     )
     assert results[0].page_content == "line one\nline two"
+
+
+@pytest.mark.asyncio
+async def test_load_browser_logs_render_safe_sites_without_raw_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout and failure diagnostics cannot serialize caller or browser secrets."""
+    timeout_url = (
+        "https://timeout-user:timeout-password@reader.example.com/private/timeout"
+        "?token=timeout-query-secret"
+    )
+    failure_url = (
+        "https://failure-user:failure-password@reader.example.org/private/failure"
+        "?token=failure-query-secret"
+    )
+    leaked_values = (
+        timeout_url,
+        failure_url,
+        "/private/timeout",
+        "/private/failure",
+        "timeout-user",
+        "timeout-password",
+        "timeout-query-secret",
+        "failure-user",
+        "failure-password",
+        "failure-query-secret",
+        "cookie-secret",
+        "header-secret",
+    )
+    dep = fake_dep()
+    page = cast("AsyncMock", dep.page)
+    page.goto.side_effect = [None, PlaywrightError(" | ".join(leaked_values))]
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    monkeypatch.setattr(production_logger, "handlers", [handler])
+    monkeypatch.setattr(production_logger, "propagate", False)
+    previous_level = production_logger.level
+    production_logger.setLevel(logging.DEBUG)
+    try:
+        results = await load_urls(
+            LoadRequest(urls=[timeout_url, failure_url]),
+            None,
+            dep,
+        )
+    finally:
+        production_logger.setLevel(previous_level)
+
+    assert results[0].page_content
+    assert results[1].page_content == ""
+    rendered = stream.getvalue()
+    assert (
+        "owui_load_networkidle_timeout site=example.com error_type=TimeoutError"
+        in rendered
+    )
+    assert "owui_load_error site=example.org error_type=Error" in rendered
+    for secret in leaked_values:
+        assert secret not in rendered

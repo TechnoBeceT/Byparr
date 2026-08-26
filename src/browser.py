@@ -16,12 +16,18 @@ from src.consts import BROWSER_LOCALE
 from src.proxy import ProxySettings
 
 
+class BrowserResourceUnusableError(RuntimeError):
+    """Signal that request-local browser state could not be restored safely."""
+
+
 def is_fatal_browser_error(error: BaseException) -> bool:
     """Classify Playwright's closed page, context, or browser failures."""
     current: BaseException | None = error
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, BrowserResourceUnusableError):
+            return True
         if isinstance(current, Exception) and is_target_closed_error(current):
             return True
         current = current.__cause__ or current.__context__

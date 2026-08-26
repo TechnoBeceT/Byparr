@@ -25,6 +25,7 @@ from main import app, lifespan
 from src.browser import BrowserFactory
 from src.challenge import CF_INTERSTITIAL_INDICATORS_SELECTORS
 from src.consts import VERSION
+from src.content import fetch_pdf_content
 from src.endpoints import read_item
 from src.models import LinkRequest
 from src.proxy import ProxySettings
@@ -272,6 +273,52 @@ class RecoverableEndpointFactory(EndpointFactory):
         return resource
 
 
+class PdfFailureEndpointFactory(EndpointFactory):
+    """Fail PDF body retrieval on the first retained browser resource."""
+
+    def __init__(self, error: PlaywrightError) -> None:
+        super().__init__()
+        self.error = error
+
+    async def open(self, proxy: ProxySettings) -> EndpointResource:
+        resource = await super().open(proxy)
+        if len(self.resources) != 1:
+            return resource
+        resource.page.goto.return_value.headers = {"content-type": "application/pdf"}
+        fetch_response = AsyncMock()
+        fetch_response.body.side_effect = self.error
+        resource.page.request.fetch.return_value = fetch_response
+        return resource
+
+
+class PartialRouteEndpointFactory(EndpointFactory):
+    """Model a route inserted locally before protocol registration fails."""
+
+    def __init__(self, *, cleanup_fails: bool = False) -> None:
+        super().__init__()
+        self.unrelated_handler = object()
+        self.handlers: list[object] = [self.unrelated_handler]
+        self.cleanup_fails = cleanup_fails
+
+    async def open(self, proxy: ProxySettings) -> EndpointResource:
+        resource = await super().open(proxy)
+        if len(self.resources) != 1:
+            return resource
+
+        async def install(_pattern: str, handler: object) -> None:
+            self.handlers.append(handler)
+            raise PlaywrightError("protocol route update failed")
+
+        async def remove(_pattern: str, handler: object) -> None:
+            if self.cleanup_fails:
+                raise PlaywrightError("protocol route cleanup failed")
+            self.handlers.remove(handler)
+
+        resource.page.route.side_effect = install
+        resource.page.unroute.side_effect = remove
+        return resource
+
+
 class ChallengeProbeEndpointFactory(EndpointFactory):
     """Drive one retained request through a selected challenge-probe failure."""
 
@@ -482,6 +529,111 @@ async def test_fatal_browser_failure_retires_the_retained_resource(
 
 
 @pytest.mark.asyncio
+async def test_fatal_pdf_body_failure_retires_retained_resource_without_logging_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A closed target during PDF body retrieval cannot become fallback success."""
+    from src.utils import logger as production_logger
+
+    full_url = (
+        "https://target-user:target-password@reader.example.com/private/document.pdf"
+        "?token=query-secret"
+    )
+    leaked_values = (
+        full_url,
+        "/private/document.pdf",
+        "target-user",
+        "target-password",
+        "query-secret",
+        "cookie-secret",
+        "header-secret",
+    )
+    error = TargetClosedError(" | ".join(leaked_values))
+    factory = PdfFailureEndpointFactory(error)
+    manager = SessionManager(factory)
+    app.state.session_manager = manager
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    monkeypatch.setattr(production_logger, "handlers", [handler])
+    monkeypatch.setattr(production_logger, "propagate", False)
+    monkeypatch.setattr(production_logger, "level", logging.INFO)
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    payload = {"url": full_url, "session": "account-secret"}
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post(
+            "/v1",
+            json=payload,
+            headers={
+                "Cookie": "cf_clearance=cookie-secret",
+                "X-Trace": "header-secret",
+            },
+        )
+        second = await client.post("/v1", json=payload)
+    await manager.close()
+
+    assert [first.status_code, second.status_code] == [
+        HTTPStatus.BAD_GATEWAY,
+        HTTPStatus.OK,
+    ]
+    assert len(factory.resources) == 2
+    assert [resource.close.await_count for resource in factory.resources] == [1, 1]
+    rendered = stream.getvalue()
+    assert (
+        "browser_request_error site=example.com error_type=TargetClosedError"
+        in rendered
+    )
+    for secret in (*leaked_values, "account-secret"):
+        assert secret not in rendered
+
+
+@pytest.mark.asyncio
+async def test_ordinary_pdf_failure_falls_back_with_secret_safe_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recoverable PDF fetch error keeps HTML fallback without logging raw data."""
+    from src.utils import logger as production_logger
+
+    full_url = (
+        "https://target-user:target-password@reader.example.com/private/document.pdf"
+        "?token=query-secret"
+    )
+    leaked_values = (
+        full_url,
+        "/private/document.pdf",
+        "target-user",
+        "target-password",
+        "query-secret",
+        "cookie-secret",
+        "header-secret",
+    )
+    dep = fake_dep()
+    page = cast("AsyncMock", dep.page)
+    page.url = full_url
+    fetch_response = AsyncMock()
+    fetch_response.body.side_effect = PlaywrightError(" | ".join(leaked_values))
+    page.request.fetch.return_value = fetch_response
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    monkeypatch.setattr(production_logger, "handlers", [handler])
+    monkeypatch.setattr(production_logger, "propagate", False)
+    monkeypatch.setattr(production_logger, "level", logging.INFO)
+
+    content_type, response_content = await fetch_pdf_content(page)
+
+    assert (content_type, response_content) == (
+        "text/html",
+        "<html><title>Login</title></html>",
+    )
+    rendered = stream.getvalue()
+    assert "pdf_fetch_fallback site=example.com error_type=Error" in rendered
+    for secret in leaked_values:
+        assert secret not in rendered
+
+
+@pytest.mark.asyncio
 async def test_block_media_routes_do_not_persist_or_accumulate_on_a_reused_page() -> (
     None
 ):
@@ -559,6 +711,76 @@ async def test_block_media_registration_cancellation_drains_then_removes_handler
 
     assert handlers == [unrelated]
     page.unroute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partial_route_registration_failure_rolls_back_owned_handler() -> None:
+    """A protocol error after local insertion cannot leave a sticky route."""
+    factory = PartialRouteEndpointFactory()
+    manager = SessionManager(factory)
+    app.state.session_manager = manager
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post(
+            "/v1",
+            json={
+                "url": "https://example.test/one",
+                "session": "account",
+                "blockMedia": True,
+            },
+        )
+        second = await client.post(
+            "/v1",
+            json={
+                "url": "https://example.test/two",
+                "session": "account",
+                "blockMedia": False,
+            },
+        )
+    await manager.close()
+
+    assert [first.status_code, second.status_code] == [
+        HTTPStatus.BAD_GATEWAY,
+        HTTPStatus.OK,
+    ]
+    assert len(factory.resources) == 1
+    assert factory.handlers == [factory.unrelated_handler]
+
+
+@pytest.mark.asyncio
+async def test_uncertain_partial_route_cleanup_retires_retained_resource() -> None:
+    """A failed rollback makes the retained page unavailable to later requests."""
+    factory = PartialRouteEndpointFactory(cleanup_fails=True)
+    manager = SessionManager(factory)
+    app.state.session_manager = manager
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post(
+            "/v1",
+            json={
+                "url": "https://example.test/one",
+                "session": "account",
+                "blockMedia": True,
+            },
+        )
+        second = await client.post(
+            "/v1",
+            json={
+                "url": "https://example.test/two",
+                "session": "account",
+                "blockMedia": False,
+            },
+        )
+    await manager.close()
+
+    assert [first.status_code, second.status_code] == [
+        HTTPStatus.BAD_GATEWAY,
+        HTTPStatus.OK,
+    ]
+    assert len(factory.resources) == 2
+    assert [resource.close.await_count for resource in factory.resources] == [1, 1]
 
 
 @pytest.mark.asyncio

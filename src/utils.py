@@ -16,7 +16,7 @@ from src.consts import (
 )
 from src.models import LinkRequest
 from src.proxy import resolve_proxy_settings
-from src.session_key import build_session_key
+from src.session_key import build_session_key, safe_site_label
 from src.sessions import SessionCapacityError, SessionManager
 
 SESSION_CAPACITY_MESSAGE = "Browser session capacity is unavailable"
@@ -36,6 +36,25 @@ logger = logging.getLogger("uvicorn.error")
 logger.setLevel(LOG_LEVEL)
 if len(logger.handlers) == 0:
     logger.addHandler(logging.StreamHandler())
+
+
+def log_browser_error(
+    event: str,
+    url: str,
+    error: BaseException,
+    *,
+    level: int = logging.ERROR,
+    outcome: str | None = None,
+) -> None:
+    """Render browser diagnostics without serializing URL or exception secrets."""
+    fields = {
+        "site": safe_site_label(url),
+        "error_type": type(error).__name__,
+    }
+    if outcome is not None:
+        fields["outcome"] = outcome
+    rendered = " ".join(f"{name}={value}" for name, value in fields.items())
+    logger.log(level, f"{event} {rendered}", extra=fields)
 
 
 class TimeoutTimer(BaseModel):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from hmac import compare_digest
 from typing import Annotated
 
@@ -12,7 +13,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel
 
 from src.consts import OWUI_API_KEY
-from src.utils import BrowserDepClass, get_browser, logger
+from src.utils import BrowserDepClass, get_browser, log_browser_error
 
 router = APIRouter(tags=["Open WebUI"])
 
@@ -66,11 +67,21 @@ async def load_urls(
             await dep.page.wait_for_load_state("domcontentloaded", timeout=30_000)
             try:
                 await dep.page.wait_for_load_state("networkidle", timeout=15_000)
-            except PlaywrightTimeoutError:
-                logger.debug("networkidle timed out for %s; extracting anyway", url)
+            except PlaywrightTimeoutError as error:
+                log_browser_error(
+                    "owui_load_networkidle_timeout",
+                    url,
+                    error,
+                    level=logging.DEBUG,
+                )
             content = await _extract_content(dep.page)
-        except Exception as exc:
-            logger.warning("Failed to load %s: %s", url, exc)
+        except Exception as error:
+            log_browser_error(
+                "owui_load_error",
+                url,
+                error,
+                level=logging.WARNING,
+            )
             content = ""
         results.append(LoadResult(page_content=content, metadata={"source": url}))
     return results

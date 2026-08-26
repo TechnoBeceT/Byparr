@@ -1,7 +1,7 @@
 import asyncio
 import time
 import warnings
-from collections.abc import AsyncGenerator, Awaitable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import Annotated
@@ -9,10 +9,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Route
+from playwright.async_api import Page, Route
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from src.browser import is_fatal_browser_error
+from src.browser import BrowserResourceUnusableError, is_fatal_browser_error
 from src.challenge import challenge_present, solve_challenge
 from src.content import build_response_content
 from src.models import (
@@ -22,12 +22,12 @@ from src.models import (
     SessionResponse,
     Solution,
 )
-from src.session_key import safe_site_label
 from src.utils import (
     BrowserDepClass,
     TimeoutTimer,
     get_browser,
     get_request_browser,
+    log_browser_error,
     logger,
     remaining_ms,
 )
@@ -76,13 +76,17 @@ async def read_item(request: LinkRequest, dep: BrowserDepClass) -> LinkResponse:
                 dep, request, timer
             )
         except (TimeoutError, PlaywrightTimeoutError) as error:
-            _log_browser_error(request.url, error, "timeout")
+            log_browser_error(
+                "browser_request_error", request.url, error, outcome="timeout"
+            )
             raise HTTPException(
                 status_code=408,
                 detail="Timed out while loading the page or solving the challenge",
             ) from error
         except PlaywrightError as error:
-            _log_browser_error(request.url, error, "failure")
+            log_browser_error(
+                "browser_request_error", request.url, error, outcome="failure"
+            )
             raise HTTPException(
                 status_code=502,
                 detail=f"Could not reach the target ({type(error).__name__})",
@@ -151,7 +155,9 @@ async def handle_v1(
     except HTTPException:
         raise
     except PlaywrightError as error:
-        _log_browser_error(request.url, error, "failure")
+        log_browser_error(
+            "browser_request_error", request.url, error, outcome="failure"
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Could not reach the target ({type(error).__name__})",
@@ -159,22 +165,11 @@ async def handle_v1(
     except BaseException as error:
         if not is_fatal_browser_error(error):
             raise
-        _log_browser_error(request.url, error, "closed")
+        log_browser_error("browser_request_error", request.url, error, outcome="closed")
         raise HTTPException(
             status_code=502,
             detail="The browser resource closed while handling the request",
         ) from error
-
-
-def _log_browser_error(url: str, error: BaseException, outcome: str) -> None:
-    """Render a browser failure without serializing exception-controlled text."""
-    fields = {
-        "site": safe_site_label(url),
-        "error_type": type(error).__name__,
-        "outcome": outcome,
-    }
-    rendered = " ".join(f"{name}={value}" for name, value in fields.items())
-    logger.error(f"browser_request_error {rendered}", extra=fields)
 
 
 @asynccontextmanager
@@ -192,19 +187,34 @@ async def setup_routes(
         else:
             await route.continue_()
 
-    registration_cancelled = await _complete_route_operation(
-        dep.page.route("**/*", block_media_route)
-    )
     try:
-        if registration_cancelled:
-            raise asyncio.CancelledError
+        registration_cancelled = await _complete_route_operation(
+            dep.page.route("**/*", block_media_route)
+        )
+    except BaseException as error:
+        cleanup_cancelled = await _remove_owned_route(dep.page, block_media_route)
+        if cleanup_cancelled:
+            raise asyncio.CancelledError from error
+        raise
+    if registration_cancelled:
+        await _remove_owned_route(dep.page, block_media_route)
+        raise asyncio.CancelledError
+    try:
         yield
     finally:
-        cleanup_cancelled = await _complete_route_operation(
-            dep.page.unroute("**/*", block_media_route)
-        )
+        cleanup_cancelled = await _remove_owned_route(dep.page, block_media_route)
         if cleanup_cancelled:
             raise asyncio.CancelledError
+
+
+async def _remove_owned_route(
+    page: Page, handler: Callable[[Route], Awaitable[None]]
+) -> bool:
+    """Remove the exact request handler or mark the browser state unusable."""
+    try:
+        return await _complete_route_operation(page.unroute("**/*", handler))
+    except BaseException as error:
+        raise BrowserResourceUnusableError from error
 
 
 async def _complete_route_operation(operation: Awaitable[object]) -> bool:
