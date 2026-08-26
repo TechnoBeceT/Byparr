@@ -1,4 +1,7 @@
-# ruff: noqa: D103, S106
+# ruff: noqa: D103, S106, S603
+
+import subprocess
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -32,6 +35,12 @@ def test_link_request_rejects_sessions_longer_than_128_characters() -> None:
         LinkRequest(url="https://example.com", session="s" * 129)
 
 
+@pytest.mark.parametrize("session", [1, [], {}])
+def test_link_request_rejects_non_string_session_values(session: object) -> None:
+    with pytest.raises(ValidationError):
+        LinkRequest(url="https://example.com", session=session)
+
+
 def test_session_key_uses_the_registrable_domain() -> None:
     proxy = ProxySettings.direct()
 
@@ -52,6 +61,31 @@ def test_session_key_isolated_by_site() -> None:
     right = build_session_key("account-a", "https://example.net", proxy)
 
     assert left != right
+
+
+@pytest.mark.parametrize("platform", ["pages.dev", "netlify.app", "vercel.app"])
+def test_session_key_isolates_private_suffix_tenants(platform: str) -> None:
+    first = build_session_key(
+        "account-a", f"https://first-tenant.{platform}", ProxySettings.direct()
+    )
+    second = build_session_key(
+        "account-a", f"https://second-tenant.{platform}", ProxySettings.direct()
+    )
+
+    assert first != second
+    assert first is not None
+    assert first.site == f"first-tenant.{platform}"
+
+
+def test_session_key_uses_uts46_idna_canonicalization() -> None:
+    proxy = ProxySettings.direct()
+
+    unicode_key = build_session_key("account-a", "https://faß.de", proxy)
+    punycode_key = build_session_key("account-a", "https://xn--fa-hia.de", proxy)
+    ascii_key = build_session_key("account-a", "https://fass.de", proxy)
+
+    assert unicode_key == punycode_key
+    assert unicode_key != ascii_key
 
 
 def test_session_key_isolated_by_proxy_egress() -> None:
@@ -90,6 +124,28 @@ def test_proxy_identity_and_repr_do_not_expose_credentials() -> None:
     assert "private-password" not in repr(proxy)
 
 
+def test_proxy_identity_is_process_private_and_stable_per_process() -> None:
+    code = (
+        "from src.proxy import ProxySettings; "
+        "print(ProxySettings('http://proxy.test:8080', 'alice', 'private-password').identity)"
+    )
+    first_process = subprocess.check_output(
+        [sys.executable, "-c", code], text=True
+    ).strip()
+    second_process = subprocess.check_output(
+        [sys.executable, "-c", code], text=True
+    ).strip()
+    local_identity = ProxySettings(
+        "http://proxy.test:8080", "alice", "private-password"
+    ).identity
+
+    assert first_process != second_process
+    assert (
+        local_identity
+        == ProxySettings("http://proxy.test:8080", "alice", "private-password").identity
+    )
+
+
 def test_header_proxy_overrides_environment_proxy() -> None:
     proxy = resolve_proxy_settings(
         header_server="http://header-proxy.test:8080",
@@ -124,6 +180,36 @@ def test_environment_proxy_is_used_when_proxy_header_is_omitted() -> None:
     }
 
 
+def test_whitespace_proxy_header_falls_back_to_environment_proxy() -> None:
+    proxy = resolve_proxy_settings(
+        header_server="  \t ",
+        header_username="ignored-header-user",
+        header_password="ignored-header-password",
+        environment_server="http://environment-proxy.test:8080",
+        environment_username="environment-user",
+        environment_password="environment-password",
+    )
+
+    assert proxy.as_playwright_proxy() == {
+        "server": "http://environment-proxy.test:8080",
+        "username": "environment-user",
+        "password": "environment-password",
+    }
+
+
+def test_whitespace_environment_proxy_uses_direct_egress() -> None:
+    proxy = resolve_proxy_settings(
+        header_server=None,
+        header_username=None,
+        header_password=None,
+        environment_server="\t ",
+        environment_username="environment-user",
+        environment_password="environment-password",
+    )
+
+    assert proxy == ProxySettings.direct()
+
+
 def test_omitted_session_has_no_session_key() -> None:
     assert (
         build_session_key(None, "https://example.com", ProxySettings.direct()) is None
@@ -131,7 +217,14 @@ def test_omitted_session_has_no_session_key() -> None:
 
 
 @pytest.mark.parametrize(
-    "url", ["example.com", "ftp://example.com", "https:///missing-host"]
+    "url",
+    [
+        "example.com",
+        "ftp://example.com",
+        "https:///missing-host",
+        "https://.",
+        "https://a..example.com",
+    ],
 )
 def test_session_key_rejects_urls_without_absolute_http_scheme(url: str) -> None:
     with pytest.raises(ValueError, match=r"absolute HTTP\(S\) URL"):

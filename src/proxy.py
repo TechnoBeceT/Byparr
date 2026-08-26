@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import hmac
+import json
+import secrets
 from dataclasses import dataclass
 from hashlib import sha256
+
+_PROXY_IDENTITY_KEY = secrets.token_bytes(32)
 
 
 @dataclass(frozen=True, repr=False)
@@ -21,11 +26,19 @@ class ProxySettings:
 
     @property
     def identity(self) -> str:
-        """Return a stable, secret-safe identifier for the selected egress."""
+        """
+        Return a process-stable, secret-safe identifier for the selected egress.
+
+        Credential changes deliberately isolate browser state because some proxy
+        providers encode egress routing in their credentials.
+        """
         if self.server is None:
             return "direct"
-        material = "\x00".join((self.server, self.username or "", self.password or ""))
-        return f"proxy:{sha256(material.encode()).hexdigest()}"
+        material = json.dumps(
+            [self.server, self.username, self.password], separators=(",", ":")
+        ).encode()
+        digest = hmac.new(_PROXY_IDENTITY_KEY, material, sha256).hexdigest()
+        return f"proxy:{digest}"
 
     def as_playwright_proxy(self) -> dict[str, str | None] | None:
         """Return the proxy format accepted by InvisiblePlaywright."""
@@ -52,10 +65,19 @@ def resolve_proxy_settings(
     environment_password: str | None,
 ) -> ProxySettings:
     """Resolve a header proxy before the configured environment proxy."""
-    if header_server:
-        return ProxySettings(header_server, header_username, header_password)
-    if environment_server:
+    selected_header_server = _proxy_selector(header_server)
+    if selected_header_server:
+        return ProxySettings(selected_header_server, header_username, header_password)
+    selected_environment_server = _proxy_selector(environment_server)
+    if selected_environment_server:
         return ProxySettings(
-            environment_server, environment_username, environment_password
+            selected_environment_server, environment_username, environment_password
         )
     return ProxySettings.direct()
+
+
+def _proxy_selector(value: str | None) -> str | None:
+    """Normalize a proxy server selector without modifying credentials."""
+    if value is None:
+        return None
+    return value.strip() or None

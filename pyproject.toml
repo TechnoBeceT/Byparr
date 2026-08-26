@@ -9,12 +9,13 @@ description = "API for getting cookies for Cloudflare challenges"
 readme = "README.md"
 dependencies = [
     "fastapi[standard]==0.141.*",
+    "idna==3.*",
     "invisible-playwright>=0.6.1",
     "playwright==1.60.*",
     "playwright-captcha==0.1.*",
     "pydantic==2.*",
     "pydantic-settings==2.*",
-    "publicsuffix2==2.20191221",
+    "tldextract==5.*",
     "trafilatura==2.2.*",
 ]
 urls = { repository = "https://github.com/ThePhaseless/Byparr" }

@@ -49,10 +49,10 @@ class LinkRequest(BaseModel):
 
     @field_validator("session", mode="before")
     @classmethod
-    def normalize_session(cls, value: str | None) -> str | None:
+    def normalize_session(cls, value: object) -> object:
         """Normalize session names while keeping them safe for identifiers and logs."""
-        if value is None:
-            return None
+        if not isinstance(value, str):
+            return value
         normalized = value.strip()
         if not normalized:
             return None
