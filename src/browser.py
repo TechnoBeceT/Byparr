@@ -22,23 +22,31 @@ class BrowserResource:
     page: Page
     context: BrowserContext
     _scope: AbstractAsyncContextManager[Browser] = field(repr=False)
-    _close_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _close_task: asyncio.Task[BaseException | None] | None = field(
+        default=None, init=False, repr=False
+    )
 
     async def close(self) -> None:
         """Await the one shared cleanup task, replaying any cleanup error."""
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close_owned())
-        await asyncio.shield(self._close_task)
+        error = await asyncio.shield(self._close_task)
+        if error is not None:
+            raise error
 
-    async def _close_owned(self) -> None:
-        """Close resources once; a context error takes precedence over an exit error."""
+    async def _close_owned(self) -> BaseException | None:
+        """Close once and return the first cleanup error without failing the task."""
         try:
             await self.context.close()
-        except BaseException:
+        except BaseException as error:
             with suppress(BaseException):
                 await self._scope.__aexit__(None, None, None)
-            raise
-        await self._scope.__aexit__(None, None, None)
+            return error
+        try:
+            await self._scope.__aexit__(None, None, None)
+        except BaseException as error:
+            return error
+        return None
 
 
 class BrowserFactory:

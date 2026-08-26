@@ -1,6 +1,7 @@
 # ruff: noqa: D102, D103, D105, D107, S106
 
 import asyncio
+import gc
 from collections.abc import AsyncGenerator
 
 import pytest
@@ -218,6 +219,40 @@ async def test_cancelled_browser_resource_closer_does_not_cancel_shared_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_closer_leaves_no_unretrieved_cleanup_error() -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    context = FakeContext(
+        close_error=RuntimeError("context cleanup"),
+        close_started=close_started,
+        allow_close=allow_close,
+    )
+    scope = FakePlaywrightScope(FakeBrowser(context=context))
+    resource = await make_factory(scope).open(ProxySettings.direct())
+    loop = asyncio.get_running_loop()
+    reports: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, report: reports.append(report))
+    try:
+        cancelled_closer = asyncio.create_task(resource.close())
+        await close_started.wait()
+        cancelled_closer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_closer
+
+        allow_close.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        del resource
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert reports == []
+
+
+@pytest.mark.asyncio
 async def test_browser_resource_replays_shared_cleanup_error_to_later_closers() -> None:
     context = FakeContext(close_error=RuntimeError("context cleanup"))
     scope = FakePlaywrightScope(FakeBrowser(context=context))
@@ -227,6 +262,34 @@ async def test_browser_resource_replays_shared_cleanup_error_to_later_closers() 
         await resource.close()
     with pytest.raises(RuntimeError, match="context cleanup"):
         await resource.close()
+
+    assert context.close_calls == 1
+    assert scope.exit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_dependency_cancellation_does_not_cancel_resource_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    context = FakeContext(close_started=close_started, allow_close=allow_close)
+    scope = FakePlaywrightScope(FakeBrowser(context=context))
+    resource = await make_factory(scope).open(ProxySettings.direct())
+    monkeypatch.setattr(utils, "BrowserFactory", lambda: FakeBrowserFactory(resource))
+    dependency = utils.get_browser()
+    await anext(dependency)
+
+    closing_dependency = asyncio.create_task(dependency.aclose())
+    await close_started.wait()
+    closing_dependency.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing_dependency
+
+    assert scope.exit_calls == 0
+
+    allow_close.set()
+    await resource.close()
 
     assert context.close_calls == 1
     assert scope.exit_calls == 1
