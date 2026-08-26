@@ -1,6 +1,7 @@
+import asyncio
 import time
 import warnings
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import Annotated
@@ -21,6 +22,7 @@ from src.models import (
     SessionResponse,
     Solution,
 )
+from src.session_key import safe_site_label
 from src.utils import (
     BrowserDepClass,
     TimeoutTimer,
@@ -73,18 +75,18 @@ async def read_item(request: LinkRequest, dep: BrowserDepClass) -> LinkResponse:
             challenge_detected, page_html, page_request = await _navigate_and_solve(
                 dep, request, timer
             )
-        except (TimeoutError, PlaywrightTimeoutError) as e:
-            logger.error("Timed out while loading the page or solving the challenge")
+        except (TimeoutError, PlaywrightTimeoutError) as error:
+            _log_browser_error(request.url, error, "timeout")
             raise HTTPException(
                 status_code=408,
                 detail="Timed out while loading the page or solving the challenge",
-            ) from e
-        except PlaywrightError as e:
-            logger.error("Could not reach the target: %s", e)
+            ) from error
+        except PlaywrightError as error:
+            _log_browser_error(request.url, error, "failure")
             raise HTTPException(
                 status_code=502,
-                detail=f"Could not reach the target: {e}",
-            ) from e
+                detail=f"Could not reach the target ({type(error).__name__})",
+            ) from error
 
         cookies = await dep.context.cookies()
         content_type, response_content = await build_response_content(
@@ -148,14 +150,31 @@ async def handle_v1(
             return await read_item(request, dep)
     except HTTPException:
         raise
+    except PlaywrightError as error:
+        _log_browser_error(request.url, error, "failure")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not reach the target ({type(error).__name__})",
+        ) from error
     except BaseException as error:
         if not is_fatal_browser_error(error):
             raise
-        logger.error("The browser resource closed while handling the request")
+        _log_browser_error(request.url, error, "closed")
         raise HTTPException(
             status_code=502,
             detail="The browser resource closed while handling the request",
         ) from error
+
+
+def _log_browser_error(url: str, error: BaseException, outcome: str) -> None:
+    """Render a browser failure without serializing exception-controlled text."""
+    fields = {
+        "site": safe_site_label(url),
+        "error_type": type(error).__name__,
+        "outcome": outcome,
+    }
+    rendered = " ".join(f"{name}={value}" for name, value in fields.items())
+    logger.error(f"browser_request_error {rendered}", extra=fields)
 
 
 @asynccontextmanager
@@ -173,11 +192,37 @@ async def setup_routes(
         else:
             await route.continue_()
 
-    await dep.page.route("**/*", block_media_route)
+    registration_cancelled = await _complete_route_operation(
+        dep.page.route("**/*", block_media_route)
+    )
     try:
+        if registration_cancelled:
+            raise asyncio.CancelledError
         yield
     finally:
-        await dep.page.unroute("**/*", block_media_route)
+        cleanup_cancelled = await _complete_route_operation(
+            dep.page.unroute("**/*", block_media_route)
+        )
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
+
+
+async def _complete_route_operation(operation: Awaitable[object]) -> bool:
+    """Drain one owned route operation and report delayed caller cancellation."""
+    task = asyncio.ensure_future(operation)
+    cancellation_seen = False
+    while True:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancellation_seen = True
+            if task.done():
+                task.result()
+                return True
+        else:
+            return cancellation_seen
 
 
 async def _navigate_and_solve(

@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections import deque
 from collections.abc import Iterable
+from io import StringIO
 from types import TracebackType
 from typing import cast
 
@@ -17,6 +18,7 @@ from src.consts import Settings
 from src.proxy import ProxySettings
 from src.session_key import SessionKey
 from src.sessions import SessionCapacityError, SessionManager
+from src.utils import logger as production_logger
 
 
 class FakeClock:
@@ -605,6 +607,21 @@ async def test_reset_fences_a_matching_pending_admission() -> None:
     assert len(factory.calls) == 1
     assert factory.tracker.live == 0
     await manager.close()
+    assert vars(manager)["_session_generations"] == {}
+    assert vars(manager)["_session_acquisitions"] == {}
+
+
+@pytest.mark.asyncio
+async def test_absent_session_resets_do_not_accumulate_generation_state() -> None:
+    """Idempotent destroys of unique absent names cannot grow process memory."""
+    manager = SessionManager(FakeFactory())
+
+    for number in range(2048):
+        assert await manager.reset(f"absent-{number}") == 0
+
+    generations = cast("dict[str, int]", vars(manager)["_session_generations"])
+    assert generations == {}
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -885,7 +902,7 @@ async def test_open_timeout_cancels_open_and_keeps_cleanup_owned(
     session_key = key("account-a", "example.com")
 
     with (
-        caplog.at_level(logging.WARNING, logger="src.sessions"),
+        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
         monkeypatch.context() as patch,
     ):
         patch.setattr(sessions, "_lifecycle_timeout", immediate_timeout)
@@ -1223,7 +1240,7 @@ async def test_lifecycle_logs_contain_only_sanitized_digests(
     manager = SessionManager(FakeFactory(), ttl_seconds=1)
     session_key = key(session_secret, site_secret, proxy)
 
-    with caplog.at_level(logging.DEBUG, logger="src.sessions"):
+    with caplog.at_level(logging.DEBUG, logger="uvicorn.error"):
         async with manager.acquire(session_key, proxy):
             pass
         assert await manager.reset(session_secret) == 1
@@ -1244,7 +1261,7 @@ async def test_lifecycle_logs_publish_bounded_pool_state_counts(
     manager = SessionManager(FakeFactory(), max_sessions=2)
     session_key = key("private-account", "example.com")
 
-    with caplog.at_level(logging.DEBUG, logger="src.sessions"):
+    with caplog.at_level(logging.DEBUG, logger="uvicorn.error"):
         async with manager.acquire(session_key, ProxySettings.direct()):
             pass
         await manager.close()
@@ -1252,7 +1269,7 @@ async def test_lifecycle_logs_publish_bounded_pool_state_counts(
     records: dict[str, dict[str, object]] = {
         str(record.__dict__.get("event", "")): record.__dict__
         for record in caplog.records
-        if record.getMessage() == "browser_session_lifecycle"
+        if record.getMessage().startswith("browser_session_lifecycle ")
     }
 
     def count(event: str, field: str) -> int:
@@ -1273,3 +1290,49 @@ async def test_lifecycle_logs_publish_bounded_pool_state_counts(
         assert 0 <= count(event, "active_count") <= 2
         assert 0 <= count(event, "idle_count") <= 2
         assert 0 <= count(event, "busy_count") <= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("log_level", [logging.INFO, logging.DEBUG])
+async def test_production_logger_renders_safe_lifecycle_state_at_configured_level(
+    monkeypatch: pytest.MonkeyPatch,
+    log_level: int,
+) -> None:
+    """The shipped text logger exposes safe identity and pool state fields."""
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    monkeypatch.setattr(production_logger, "handlers", [handler])
+    monkeypatch.setattr(production_logger, "propagate", False)
+    monkeypatch.setattr(production_logger, "level", log_level)
+    session_secret = "session-never-render"
+    proxy = ProxySettings(
+        "http://proxy.example:8080", "proxy-user-never-render", "proxy-secret"
+    )
+    manager = SessionManager(FakeFactory(), max_sessions=2)
+    session_key = key(session_secret, "reader.example.com", proxy)
+
+    async with manager.acquire(session_key, proxy):
+        pass
+    async with manager.acquire(session_key, proxy):
+        pass
+    assert await manager.reset(session_secret) == 1
+    await manager.close()
+
+    rendered = stream.getvalue()
+    assert "browser_session_lifecycle event=create" in rendered
+    assert "browser_session_lifecycle event=reuse" in rendered
+    assert "active_count=1" in rendered
+    assert "idle_count=1" in rendered
+    assert "busy_count=1" in rendered
+    assert "capacity_limit=2" in rendered
+    assert "session_digest=" in rendered
+    assert "site_digest=" in rendered
+    assert "proxy_digest=" in rendered
+    for secret in (
+        session_secret,
+        "reader.example.com",
+        "proxy-user-never-render",
+        "proxy-secret",
+    ):
+        assert secret not in rendered

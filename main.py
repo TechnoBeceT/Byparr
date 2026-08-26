@@ -30,8 +30,11 @@ async def expire_idle_sessions(manager: SessionManager) -> None:
         await asyncio.sleep(_IDLE_EXPIRY_INTERVAL_SECONDS)
         try:
             await manager.expire_idle()
-        except Exception:
-            logger.exception("Unable to expire idle browser sessions")
+        except Exception as error:
+            logger.error(
+                "browser_session_expiry_failed error_type=%s",
+                type(error).__name__,
+            )
 
 
 @asynccontextmanager

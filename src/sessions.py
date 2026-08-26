@@ -71,6 +71,7 @@ class SessionManager:
         self._barriers: dict[SessionKey, SessionEntry] = {}
         self._admissions: dict[SessionKey, AdmissionReservation] = {}
         self._session_generations: dict[str, int] = {}
+        self._session_acquisitions: dict[str, int] = {}
         self._map_lock = asyncio.Lock()
         self._touch_order = 0
         self._closed = False
@@ -83,8 +84,19 @@ class SessionManager:
         """Lease the retained browser for one key, creating it only once."""
         if key.proxy_id != proxy.identity:
             raise SessionProxyMismatchError
-        async with self._map_lock:
-            generation = self._session_generations.get(key.session, 0)
+        generation = await self._register_acquisition(key.session)
+        try:
+            async with self._acquire_registered(key, proxy, generation) as browser:
+                yield browser
+        finally:
+            cleanup = asyncio.create_task(self._unregister_acquisition(key.session))
+            await asyncio.shield(cleanup)
+
+    @asynccontextmanager
+    async def _acquire_registered(
+        self, key: SessionKey, proxy: ProxySettings, generation: int
+    ) -> AsyncGenerator[BrowserDepClass]:
+        """Lease one resource while its reset-fence observer is registered."""
         while True:
             entry = await self._claim_entry(key, proxy, generation)
             lease_acquired = False
@@ -129,9 +141,6 @@ class SessionManager:
     async def reset(self, session: str) -> int:
         """Retire every site and proxy entry for one exact normalized session."""
         async with self._map_lock:
-            self._session_generations[session] = (
-                self._session_generations.get(session, 0) + 1
-            )
             entries = [
                 entry for entry in self._owned.values() if entry.key.session == session
             ]
@@ -140,6 +149,10 @@ class SessionManager:
                 for reservation in self._admissions.values()
                 if reservation.key.session == session
             ]
+            if entries or reservations or self._session_acquisitions.get(session, 0):
+                self._session_generations[session] = (
+                    self._session_generations.get(session, 0) + 1
+                )
             tasks = [self._schedule_retirement_locked(entry) for entry in entries]
             tasks.extend(
                 reservation.task
@@ -312,6 +325,7 @@ class SessionManager:
             ):
                 self._new_entry_locked(reservation.key, proxy, claims=0)
                 created = True
+            self._drop_generation_locked(reservation.key.session)
             snapshot = self._snapshot_locked()
         if created:
             log_session_event(
@@ -366,6 +380,39 @@ class SessionManager:
             snapshot = self._snapshot_locked()
             event = "idle" if entry.claims == 0 else "busy"
         log_session_event(logging.DEBUG, event, entry.key, snapshot=snapshot)
+
+    async def _register_acquisition(self, session: str) -> int:
+        """Publish a reset-fence observer before an acquisition can be reset."""
+        async with self._map_lock:
+            self._session_acquisitions[session] = (
+                self._session_acquisitions.get(session, 0) + 1
+            )
+            return self._session_generations.get(session, 0)
+
+    async def _unregister_acquisition(self, session: str) -> None:
+        """Release one observer and discard fence state once nobody can see it."""
+        async with self._map_lock:
+            remaining = self._session_acquisitions[session] - 1
+            if remaining:
+                self._session_acquisitions[session] = remaining
+            else:
+                self._session_acquisitions.pop(session)
+            self._drop_generation_locked(session)
+
+    def _drop_generation_locked(self, session: str) -> None:
+        """Remove a generation after all matching observers and ownership drain."""
+        if session not in self._session_generations:
+            return
+        if self._session_acquisitions.get(session, 0):
+            return
+        if any(entry.key.session == session for entry in self._owned.values()):
+            return
+        if any(
+            reservation.key.session == session
+            for reservation in self._admissions.values()
+        ):
+            return
+        self._session_generations.pop(session)
 
     def _lru_idle_entry_locked(self) -> SessionEntry | None:
         """Select the stable least-recently-used admitted idle entry."""
@@ -471,6 +518,7 @@ class SessionManager:
             self._owned.pop(id(entry), None)
             entry.terminal_error = error
             entry.retired.set()
+            self._drop_generation_locked(entry.key.session)
 
     async def _begin_shutdown(
         self,

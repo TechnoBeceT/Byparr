@@ -1,15 +1,14 @@
 import time
 from asyncio import sleep
-from contextlib import suppress
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import FloatRect, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright_captcha.solvers.click.cloudflare.utils.detection import (
     CF_INTERSTITIAL_INDICATORS_SELECTORS,
-    detect_cloudflare_challenge,
 )
 
+from src.browser import is_fatal_browser_error
 from src.utils import TimeoutTimer, logger
 
 __all__ = [
@@ -34,14 +33,24 @@ WIDGET_MAX_HEIGHT = 120
 
 async def challenge_present(page: Page) -> bool:
     """Report whether the Cloudflare interstitial is up."""
-    return await detect_cloudflare_challenge(page, "interstitial")
+    for selector in CF_INTERSTITIAL_INDICATORS_SELECTORS:
+        try:
+            if await page.locator(selector).count() == 0:
+                continue
+        except (PlaywrightError, PlaywrightTimeoutError) as error:
+            if is_fatal_browser_error(error):
+                raise
+            if "Execution context was destroyed" in str(error):
+                return False
+        return True
+    return False
 
 
 async def widget_box(page: Page) -> FloatRect | None:
     """Measure the widget container with locators; running page scripts resets the challenge."""
     for depth in WIDGET_ANCESTOR_DEPTHS:
         widget = page.locator(f"{TURNSTILE_INPUT} >> xpath=ancestor::div[{depth}]")
-        with suppress(PlaywrightError, PlaywrightTimeoutError):
+        try:
             if await widget.count() == 0:
                 continue
             box = await widget.first.bounding_box(timeout=BOX_READ_TIMEOUT)
@@ -51,6 +60,9 @@ async def widget_box(page: Page) -> FloatRect | None:
                 and WIDGET_MIN_HEIGHT < box["height"] < WIDGET_MAX_HEIGHT
             ):
                 return box
+        except (PlaywrightError, PlaywrightTimeoutError) as error:
+            if is_fatal_browser_error(error):
+                raise
     return None
 
 
@@ -70,9 +82,12 @@ async def click_checkbox(page: Page) -> bool:
 async def checkbox_already_answered(page: Page) -> bool:
     """Report whether Turnstile has already filled in its response token."""
     token = page.locator(TURNSTILE_INPUT)
-    with suppress(PlaywrightError, PlaywrightTimeoutError):
+    try:
         if await token.count() > 0:
             return bool(await token.first.input_value(timeout=TOKEN_READ_TIMEOUT))
+    except (PlaywrightError, PlaywrightTimeoutError) as error:
+        if is_fatal_browser_error(error):
+            raise
     return False
 
 
@@ -98,10 +113,13 @@ async def solve_challenge(page: Page, timer: TimeoutTimer) -> None:
 
         if time.perf_counter() >= next_click:
             landed = False
-            with suppress(PlaywrightError, PlaywrightTimeoutError):
+            try:
                 landed = not await checkbox_already_answered(
                     page
                 ) and await click_checkbox(page)
+            except (PlaywrightError, PlaywrightTimeoutError) as error:
+                if is_fatal_browser_error(error):
+                    raise
             if landed:
                 clicks += 1
                 logger.info("Clicked the challenge checkbox (attempt %d).", clicks)

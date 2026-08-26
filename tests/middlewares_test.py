@@ -3,6 +3,7 @@
 import logging
 from collections.abc import AsyncGenerator, Generator
 from http import HTTPStatus
+from io import StringIO
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from main import app
 from src.middlewares import LogRequest
 from src.utils import BrowserDepClass, get_browser
+from src.utils import logger as production_logger
 
 
 @pytest.fixture(autouse=True)
@@ -111,7 +113,9 @@ async def test_solve_logs_use_sanitized_site_context_without_request_secrets(
 
     assert response.status_code == HTTPStatus.OK
     solve_records = [
-        record for record in caplog.records if record.getMessage() == "browser_solve"
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("browser_solve ")
     ]
     fields = [record.__dict__ for record in solve_records]
     assert [field["event"] for field in fields] == [
@@ -138,3 +142,53 @@ async def test_solve_logs_use_sanitized_site_context_without_request_secrets(
         "proxy-super-secret",
     ):
         assert secret not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("log_level", [logging.INFO, logging.DEBUG])
+async def test_production_text_logger_renders_safe_solve_context(
+    monkeypatch: pytest.MonkeyPatch,
+    log_level: int,
+) -> None:
+    """The shipped formatter receives useful solve fields in the message text."""
+    target = FastAPI()
+
+    async def solve() -> dict[str, str]:
+        return {"status": "ok"}
+
+    target.add_api_route("/v1", solve, methods=["POST"])
+    target.add_middleware(LogRequest)
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    monkeypatch.setattr(production_logger, "handlers", [handler])
+    monkeypatch.setattr(production_logger, "propagate", False)
+    monkeypatch.setattr(production_logger, "level", log_level)
+    transport = ASGITransport(app=target)
+
+    async with AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as local_client:
+        response = await local_client.post(
+            "/v1",
+            json={
+                "url": "https://reader.example.com/private?token=secret",
+                "session": "account-secret",
+                "maxTimeout": 7000,
+            },
+        )
+
+    assert response.status_code == HTTPStatus.OK
+    rendered = stream.getvalue()
+    assert (
+        "browser_solve event=solve_start site=example.com timeout_seconds=7 "
+        "session_mode=retained" in rendered
+    )
+    assert (
+        "browser_solve event=solve_finish site=example.com timeout_seconds=7"
+        in rendered
+    )
+    assert "outcome=success" in rendered
+    assert "duration_ms=" in rendered
+    for secret in ("/private", "token=secret", "account-secret"):
+        assert secret not in rendered

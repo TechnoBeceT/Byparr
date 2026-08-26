@@ -10,7 +10,7 @@ from hashlib import sha256
 from src._session_state import SessionPoolSnapshot
 from src.session_key import SessionKey
 
-logger = logging.getLogger("src.sessions")
+logger = logging.getLogger("uvicorn.error")
 _LOG_DIGEST_KEY = secrets.token_bytes(32)
 
 
@@ -47,7 +47,12 @@ def log_session_event(
                 "capacity_limit": snapshot.capacity_limit,
             }
         )
-    logger.log(level, "browser_session_lifecycle", extra=fields)
+    rendered = " ".join(f"{name}={value}" for name, value in fields.items())
+    logger.log(
+        max(level, logging.INFO),
+        f"browser_session_lifecycle {rendered}",
+        extra=fields,
+    )
 
 
 def _digest(value: str) -> str:

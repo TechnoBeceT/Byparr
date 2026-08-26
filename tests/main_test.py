@@ -2,8 +2,10 @@
 
 import asyncio
 import base64
+import logging
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from io import StringIO
 from json import JSONDecodeError
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -270,6 +272,84 @@ class RecoverableEndpointFactory(EndpointFactory):
         return resource
 
 
+class ChallengeProbeEndpointFactory(EndpointFactory):
+    """Drive one retained request through a selected challenge-probe failure."""
+
+    def __init__(
+        self,
+        probe: str,
+        *,
+        fatal: bool,
+        clear_after_marker_calls: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.probe = probe
+        self.fatal = fatal
+        self.clear_after_marker_calls = clear_after_marker_calls
+        self.marker_calls = 0
+
+    async def open(self, proxy: ProxySettings) -> EndpointResource:
+        resource = await super().open(proxy)
+        if len(self.resources) != 1:
+            return resource
+        error = self._probe_error()
+        marker = self._marker(error)
+        token = self._token(error)
+        widget = self._widget(error)
+        if self.probe == "click":
+            resource.page.mouse.move.side_effect = error
+
+        def locator(selector: str) -> MagicMock:
+            if selector in CF_INTERSTITIAL_INDICATORS_SELECTORS:
+                return marker
+            if selector == 'input[name="cf-turnstile-response"]':
+                return token
+            return widget
+
+        resource.page.locator.side_effect = locator
+        return resource
+
+    def _probe_error(self) -> PlaywrightError:
+        if self.fatal:
+            return TargetClosedError("browser has been closed")
+        return PlaywrightError("ordinary probe failure")
+
+    def _marker(self, error: PlaywrightError) -> MagicMock:
+        marker = MagicMock()
+
+        def marker_count() -> int:
+            self.marker_calls += 1
+            if self.probe == "marker":
+                raise error
+            if (
+                self.clear_after_marker_calls is not None
+                and self.marker_calls >= self.clear_after_marker_calls
+            ):
+                return 0
+            return 1
+
+        marker.count = AsyncMock(side_effect=marker_count)
+        return marker
+
+    def _token(self, error: PlaywrightError) -> MagicMock:
+        token = MagicMock()
+        token.count = AsyncMock(return_value=0)
+        token.first.input_value = AsyncMock(return_value="")
+        if self.probe == "token":
+            token.count.side_effect = error
+        return token
+
+    def _widget(self, error: PlaywrightError) -> MagicMock:
+        widget = MagicMock()
+        widget.count = AsyncMock(return_value=1)
+        widget.first.bounding_box = AsyncMock(
+            return_value={"x": 1.0, "y": 2.0, "width": 100.0, "height": 50.0}
+        )
+        if self.probe == "widget":
+            widget.count.side_effect = error
+        return widget
+
+
 class RejectingSessionManager:
     """Model a saturated retained-session manager at the HTTP boundary."""
 
@@ -446,6 +526,76 @@ async def test_block_media_route_is_removed_when_navigation_is_cancelled() -> No
 
 
 @pytest.mark.asyncio
+async def test_block_media_registration_cancellation_drains_then_removes_handler() -> (
+    None
+):
+    """Cancellation after route installation cannot release a sticky handler."""
+    dep = fake_dep()
+    page = cast("AsyncMock", dep.page)
+    unrelated = object()
+    handlers: list[object] = [unrelated]
+    registration_started = asyncio.Event()
+    allow_registration_return = asyncio.Event()
+
+    async def install(_pattern: str, handler: object) -> None:
+        handlers.append(handler)
+        registration_started.set()
+        await allow_registration_return.wait()
+
+    async def remove(_pattern: str, handler: object) -> None:
+        handlers.remove(handler)
+
+    page.route.side_effect = install
+    page.unroute.side_effect = remove
+    reading = asyncio.create_task(
+        read_item(LinkRequest(url="https://example.test", blockMedia=True), dep)
+    )
+    await registration_started.wait()
+    reading.cancel()
+    allow_registration_return.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+
+    assert handlers == [unrelated]
+    page.unroute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_block_media_cleanup_cancellation_drains_exact_handler_removal() -> None:
+    """Cancellation during unroute cannot release the retained page prematurely."""
+    dep = fake_dep()
+    page = cast("AsyncMock", dep.page)
+    unrelated = object()
+    handlers: list[object] = [unrelated]
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+
+    async def install(_pattern: str, handler: object) -> None:
+        handlers.append(handler)
+
+    async def remove(_pattern: str, handler: object) -> None:
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        handlers.remove(handler)
+
+    page.route.side_effect = install
+    page.unroute.side_effect = remove
+    reading = asyncio.create_task(
+        read_item(LinkRequest(url="https://example.test", blockMedia=True), dep)
+    )
+    await cleanup_started.wait()
+    reading.cancel()
+    allow_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+
+    assert handlers == [unrelated]
+    page.unroute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_block_media_route_is_removed_when_navigation_fails() -> None:
     """A recoverable navigation error cannot leak a request-owned route."""
     dep = fake_dep()
@@ -482,6 +632,127 @@ async def test_recoverable_navigation_failure_preserves_the_retained_resource() 
 
     assert [first.status_code, second.status_code] == [
         HTTPStatus.BAD_GATEWAY,
+        HTTPStatus.OK,
+    ]
+    assert len(factory.resources) == 1
+    factory.resources[0].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_playwright_failure_log_uses_safe_site_and_error_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raw browser exception text cannot reach production-rendered logs."""
+    from src.utils import logger as production_logger
+
+    full_url = (
+        "https://target-user:target-password@reader.example.com/private/path"
+        "?token=clearance-secret"
+    )
+    leaked_values = (
+        full_url,
+        "/private/path",
+        "target-user",
+        "target-password",
+        "clearance-secret",
+        "cookie-super-secret",
+        "header-super-secret",
+        "proxy-user-secret",
+        "proxy-password-secret",
+    )
+    factory = EndpointFactory()
+    resource = await factory.open(ProxySettings.direct())
+    resource.page.goto.side_effect = PlaywrightError(" | ".join(leaked_values))
+    factory.resources.clear()
+
+    async def reuse_configured_resource(proxy: ProxySettings) -> EndpointResource:
+        _ = proxy
+        factory.resources.append(resource)
+        return resource
+
+    monkeypatch.setattr(factory, "open", reuse_configured_resource)
+    manager = SessionManager(factory)
+    app.state.session_manager = manager
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    monkeypatch.setattr(production_logger, "handlers", [handler])
+    monkeypatch.setattr(production_logger, "propagate", False)
+    monkeypatch.setattr(production_logger, "level", logging.INFO)
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1",
+            json={"url": full_url, "session": "account-secret"},
+            headers={
+                "Cookie": "cf_clearance=cookie-super-secret",
+                "X-Trace": "header-super-secret",
+                "X-Proxy-Server": "http://proxy.example:8080",
+                "X-Proxy-Username": "proxy-user-secret",
+                "X-Proxy-Password": "proxy-password-secret",
+            },
+        )
+    await manager.close()
+
+    assert response.status_code == HTTPStatus.BAD_GATEWAY
+    rendered = stream.getvalue()
+    assert "browser_request_error site=example.com error_type=Error" in rendered
+    for secret in (*leaked_values, "account-secret"):
+        assert secret not in rendered
+
+
+@pytest.mark.parametrize("fatal_probe", ["marker", "token", "widget", "click"])
+@pytest.mark.asyncio
+async def test_fatal_challenge_probe_retires_the_retained_resource(
+    fatal_probe: str,
+) -> None:
+    """Target closure in any tolerant probe cannot leave a dead session reusable."""
+    factory = ChallengeProbeEndpointFactory(fatal_probe, fatal=True)
+    manager = SessionManager(factory)
+    app.state.session_manager = manager
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    payload = {
+        "url": "https://example.test/challenge",
+        "session": "account",
+        "maxTimeout": 0,
+    }
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post("/v1", json=payload)
+        second = await client.post("/v1", json=payload)
+    await manager.close()
+
+    assert [first.status_code, second.status_code] == [
+        HTTPStatus.BAD_GATEWAY,
+        HTTPStatus.OK,
+    ]
+    assert len(factory.resources) == 2
+    assert [resource.close.await_count for resource in factory.resources] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_challenge_probe_error_preserves_the_retained_resource() -> None:
+    """A nonfatal probe failure retains the browser for the next request."""
+    factory = ChallengeProbeEndpointFactory(
+        "token", fatal=False, clear_after_marker_calls=3
+    )
+    manager = SessionManager(factory)
+    app.state.session_manager = manager
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    payload = {
+        "url": "https://example.test/challenge",
+        "session": "account",
+        "maxTimeout": 0,
+    }
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post("/v1", json=payload)
+        second = await client.post("/v1", json=payload)
+    await manager.close()
+
+    assert [first.status_code, second.status_code] == [
+        HTTPStatus.REQUEST_TIMEOUT,
         HTTPStatus.OK,
     ]
     assert len(factory.resources) == 1
