@@ -14,6 +14,7 @@ from src.consts import (
     PROXY_SERVER,
     PROXY_USERNAME,
 )
+from src.models import LinkRequest
 from src.proxy import resolve_proxy_settings
 from src.session_key import build_session_key
 from src.sessions import SessionCapacityError, SessionManager
@@ -93,7 +94,7 @@ async def get_browser(
 
 @asynccontextmanager
 async def get_request_browser(
-    request,
+    request: LinkRequest,
     manager: SessionManager | None,
     *,
     x_proxy_server: str | None = None,

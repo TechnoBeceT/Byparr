@@ -16,7 +16,9 @@ from pydantic import ValidationError
 from starlette.testclient import TestClient
 
 from main import app, lifespan
+from src.browser import BrowserFactory
 from src.challenge import CF_INTERSTITIAL_INDICATORS_SELECTORS
+from src.consts import VERSION
 from src.endpoints import read_item
 from src.models import LinkRequest
 from src.sessions import SessionCapacityError
@@ -200,7 +202,7 @@ class EndpointResource:
 
     def __init__(self, number: int) -> None:
         self.page = fake_dep().page
-        self.context = fake_dep().context
+        self.context = AsyncMock()
         self.context.cookies.return_value = [
             {
                 "name": "browser",
@@ -255,7 +257,9 @@ class RecordingSessionManager:
         return 2
 
 
-def test_named_session_reuses_its_site_but_isolates_other_sites(monkeypatch):
+def test_named_session_reuses_its_site_but_isolates_other_sites(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A same-site session keeps its context and a different site gets another."""
     from src import utils
 
@@ -300,7 +304,7 @@ def test_named_session_reuses_its_site_but_isolates_other_sites(monkeypatch):
     assert [resource.close.await_count for resource in factory.resources] == [1, 1]
 
 
-def test_blank_sessions_remain_disposable(monkeypatch):
+def test_blank_sessions_remain_disposable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Blank session declarations never retain a browser context."""
     from src import utils
 
@@ -320,7 +324,9 @@ def test_blank_sessions_remain_disposable(monkeypatch):
     assert [resource.close.await_count for resource in factory.resources] == [1, 1]
 
 
-def test_retained_session_capacity_overload_is_a_stable_503(monkeypatch):
+def test_retained_session_capacity_overload_is_a_stable_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A saturated named-session pool fails without disclosing session details."""
     from src import utils
 
@@ -354,7 +360,9 @@ def test_link_request_rejects_commands_outside_the_flaresolverr_set():
         )
 
 
-def test_session_create_is_a_lazy_idempotent_declaration(monkeypatch):
+def test_session_create_is_a_lazy_idempotent_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Repeated creates succeed without asking the browser factory for a context."""
     from src import utils
 
@@ -374,14 +382,30 @@ def test_session_create_is_a_lazy_idempotent_declaration(monkeypatch):
 
     assert first.status_code == HTTPStatus.OK
     assert second.status_code == HTTPStatus.OK
-    assert first.json()["message"] == "Session created successfully."
-    assert second.json()["message"] == "Session created successfully."
-    assert "solution" not in first.json()
+    for response in (first, second):
+        body = response.json()
+        assert set(body) == {
+            "status",
+            "message",
+            "session",
+            "startTimestamp",
+            "endTimestamp",
+            "version",
+        }
+        assert body["status"] == "ok"
+        assert body["message"] == "Session created successfully."
+        assert body["session"] == "account"
+        assert isinstance(body["startTimestamp"], int)
+        assert isinstance(body["endTimestamp"], int)
+        assert body["endTimestamp"] >= body["startTimestamp"]
+        assert body["version"] == VERSION
     assert factory.resources == []
     assert manager.acquire_calls == 0
 
 
-def test_session_destroy_resets_every_exact_normalized_name_idempotently(monkeypatch):
+def test_session_destroy_resets_every_exact_normalized_name_idempotently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Destroy closes every site for its exact name and stays idempotent."""
     from src import utils
 
@@ -433,7 +457,47 @@ def test_session_destroy_resets_every_exact_normalized_name_idempotently(monkeyp
     assert second.json()["message"] == "The session has been removed."
 
 
-def test_health_check_uses_a_disposable_browser_not_the_session_manager(monkeypatch):
+def test_session_destroy_timestamp_brackets_reset_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Destroy records its start before reset and its completion after reset returns."""
+    from src import utils
+
+    class Clock:
+        def __init__(self) -> None:
+            self.value = 10.0
+
+        def __call__(self) -> float:
+            return self.value
+
+    class TimedManager:
+        async def reset(self, session: str) -> int:
+            assert session == "account"
+            assert clock.value == 10.0
+            clock.value = 20.0
+            return 1
+
+    clock = Clock()
+    factory = EndpointFactory()
+    monkeypatch.setattr(utils, "BrowserFactory", lambda: factory)
+    monkeypatch.setattr("main.BrowserFactory", lambda: factory)
+    monkeypatch.setattr("src.endpoints.time.time", clock)
+
+    with TestClient(app) as test_client:
+        app.state.session_manager = TimedManager()
+        response = test_client.post(
+            "/v1", json={"cmd": "sessions.destroy", "session": "account"}
+        )
+
+    assert response.status_code == HTTPStatus.OK
+    body = response.json()
+    assert body["startTimestamp"] == 10_000
+    assert body["endTimestamp"] == 20_000
+
+
+def test_health_check_uses_a_disposable_browser_not_the_session_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Health checks cannot create a retained entry because they have no session key."""
     from src import utils
 
@@ -453,7 +517,9 @@ def test_health_check_uses_a_disposable_browser_not_the_session_manager(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_lifespan_cancels_expiry_before_closing_the_session_manager(monkeypatch):
+async def test_lifespan_cancels_expiry_before_closing_the_session_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Shutdown awaits expiry-task cancellation before retained resources close."""
     events: list[str] = []
 
@@ -470,7 +536,10 @@ async def test_lifespan_cancels_expiry_before_closing_the_session_manager(monkey
         finally:
             events.append("expiry-cancelled")
 
-    monkeypatch.setattr("main.SessionManager", lambda _factory: manager)
+    def build_manager(_factory: BrowserFactory) -> LifecycleManager:
+        return manager
+
+    monkeypatch.setattr("main.SessionManager", build_manager)
     monkeypatch.setattr("main.expire_idle_sessions", wait_for_cancellation)
 
     async with lifespan(app):

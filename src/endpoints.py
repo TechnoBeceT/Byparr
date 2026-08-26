@@ -111,7 +111,7 @@ async def read_item(request: LinkRequest, dep: BrowserDepClass) -> LinkResponse:
     )
 
 
-@router.post("/v1")
+@router.post("/v1", response_model_exclude_none=True)
 async def handle_v1(
     request: LinkRequest,
     app_request: Request,
@@ -120,11 +120,20 @@ async def handle_v1(
     x_proxy_password: Annotated[str | None, Header(alias="X-Proxy-Password")] = None,
 ) -> LinkResponse | SessionResponse:
     """Select the request browser lifecycle before running navigation."""
+    start_time = int(time.time() * 1000)
     if request.cmd == "sessions.create":
-        return SessionResponse(message="Session created successfully.")
+        assert request.session is not None
+        return SessionResponse(
+            message="Session created successfully.",
+            session=request.session,
+            start_timestamp=start_time,
+        )
     if request.cmd == "sessions.destroy":
+        assert request.session is not None
         await app_request.app.state.session_manager.reset(request.session)
-        return SessionResponse(message="The session has been removed.")
+        return SessionResponse(
+            message="The session has been removed.", start_timestamp=start_time
+        )
     async with get_request_browser(
         request,
         getattr(app_request.app.state, "session_manager", None),

@@ -125,6 +125,7 @@ class SessionResponse(BaseModel):
     model_config = {"alias_generator": to_camel, "populate_by_name": True}
     status: str = "ok"
     message: str
+    session: str | None = None
     start_timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
     end_timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
     version: str = consts.VERSION

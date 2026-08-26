@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 
 import uvicorn
@@ -35,7 +35,7 @@ async def expire_idle_sessions(manager: SessionManager) -> None:
 
 
 @asynccontextmanager
-async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     """Own the bounded retained-session manager for the application lifetime."""
     manager = SessionManager(BrowserFactory())
     application.state.session_manager = manager
