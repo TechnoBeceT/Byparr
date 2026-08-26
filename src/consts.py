@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     browser_locale: str | None = None
     session_ttl_seconds: int = Field(default=900, ge=1)
     session_max_sessions: int = Field(default=8, ge=1)
+    session_lifecycle_timeout_seconds: int = Field(default=120, ge=1)
 
 
 settings = Settings()
@@ -44,3 +45,4 @@ OWUI_API_KEY = settings.owui_api_key
 BROWSER_LOCALE = settings.browser_locale
 SESSION_TTL_SECONDS = settings.session_ttl_seconds
 SESSION_MAX_SESSIONS = settings.session_max_sessions
+SESSION_LIFECYCLE_TIMEOUT_SECONDS = settings.session_lifecycle_timeout_seconds

@@ -18,6 +18,7 @@ def log_session_event(
     event: str,
     key: SessionKey,
     error: BaseException | None = None,
+    reason: str | None = None,
 ) -> None:
     """Log lifecycle events with keyed digests instead of identifiers."""
     fields: dict[str, str] = {
@@ -28,6 +29,8 @@ def log_session_event(
     }
     if error is not None:
         fields["error_type"] = type(error).__name__
+    if reason is not None:
+        fields["reason"] = reason
     logger.log(level, "browser_session_lifecycle", extra=fields)
 
 

@@ -1,4 +1,6 @@
-# ruff: noqa: D102, D103, D107, PLR2004, S105
+# ruff: noqa: ANN002, ANN003, D102, D103, D105, D107, PLR2004, S105
+
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -7,6 +9,7 @@ from collections import deque
 import pytest
 from pydantic import ValidationError
 
+from src import sessions
 from src.consts import Settings
 from src.proxy import ProxySettings
 from src.session_key import SessionKey
@@ -22,16 +25,33 @@ class FakeClock:
 
 
 class FakeResource:
-    def __init__(self, name: str, *, close_error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        close_error: BaseException | None = None,
+        close_started: asyncio.Event | None = None,
+        allow_close: asyncio.Event | None = None,
+        tracker: LiveResourceTracker | None = None,
+    ) -> None:
         self.name = name
         self.page = f"page:{name}"
         self.context = f"context:{name}"
         self.close_error = close_error
         self.close_calls = 0
         self.closed = asyncio.Event()
+        self.close_started = close_started
+        self.allow_close = allow_close
+        self.tracker = tracker
 
     async def close(self) -> None:
         self.close_calls += 1
+        if self.close_started is not None:
+            self.close_started.set()
+        if self.allow_close is not None:
+            await self.allow_close.wait()
+        if self.tracker is not None:
+            self.tracker.closed()
         self.closed.set()
         if self.close_error is not None:
             raise self.close_error
@@ -61,6 +81,84 @@ class FakeFactory:
         return resource
 
 
+class LiveResourceTracker:
+    def __init__(self) -> None:
+        self.live = 0
+        self.maximum = 0
+
+    def opened(self) -> None:
+        self.live += 1
+        self.maximum = max(self.maximum, self.live)
+
+    def closed(self) -> None:
+        self.live -= 1
+
+
+class TrackedFactory:
+    def __init__(self, tracker: LiveResourceTracker) -> None:
+        self.tracker = tracker
+        self.calls: list[ProxySettings] = []
+        self.close_started = asyncio.Event()
+        self.allow_close = asyncio.Event()
+        self.resources: list[FakeResource] = []
+
+    async def open(self, proxy: ProxySettings) -> FakeResource:
+        self.calls.append(proxy)
+        self.tracker.opened()
+        resource = FakeResource(
+            str(len(self.resources) + 1),
+            close_started=self.close_started if not self.resources else None,
+            allow_close=self.allow_close if not self.resources else None,
+            tracker=self.tracker,
+        )
+        self.resources.append(resource)
+        return resource
+
+
+class CancellingOpenFactory:
+    def __init__(self) -> None:
+        self.calls: list[ProxySettings] = []
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.allow_cleanup = asyncio.Event()
+        self.cleanup_finished = asyncio.Event()
+
+    async def open(self, proxy: ProxySettings):
+        self.calls.append(proxy)
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await self.allow_cleanup.wait()
+            self.cleanup_finished.set()
+            raise
+
+
+class ImmediateTimeout:
+    def __init__(self) -> None:
+        self.task: asyncio.Task | None = None
+        self.cancellation: asyncio.Handle | None = None
+
+    async def __aenter__(self) -> None:
+        self.task = asyncio.current_task()
+        assert self.task is not None
+        self.cancellation = asyncio.get_running_loop().call_soon(self.task.cancel)
+
+    async def __aexit__(self, error_type, _error, _traceback) -> bool:
+        if self.cancellation is not None:
+            self.cancellation.cancel()
+        if error_type is asyncio.CancelledError:
+            assert self.task is not None
+            self.task.uncancel()
+            raise TimeoutError
+        return False
+
+
+def immediate_timeout(_seconds: float) -> ImmediateTimeout:
+    return ImmediateTimeout()
+
+
 async def next_turn() -> None:
     """Yield through an event-loop callback without timing-based sleeps."""
     reached = asyncio.Event()
@@ -78,6 +176,8 @@ def test_session_settings_reject_non_positive_limits() -> None:
         Settings(session_ttl_seconds=0)
     with pytest.raises(ValidationError):
         Settings(session_max_sessions=0)
+    with pytest.raises(ValidationError):
+        Settings(session_lifecycle_timeout_seconds=0)
 
 
 def test_session_settings_have_bounded_defaults() -> None:
@@ -85,6 +185,7 @@ def test_session_settings_have_bounded_defaults() -> None:
 
     assert settings.session_ttl_seconds == 900
     assert settings.session_max_sessions == 8
+    assert settings.session_lifecycle_timeout_seconds == 120
 
 
 @pytest.mark.asyncio
@@ -401,6 +502,367 @@ async def test_invalidate_retires_a_fatal_active_resource() -> None:
 
     assert len(factory.calls) == 2
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_blocks_same_key_replacement_until_cleanup_finishes() -> None:
+    tracker = LiveResourceTracker()
+    factory = TrackedFactory(tracker)
+    manager = SessionManager(factory, max_sessions=1)
+    session_key = key("account-a", "example.com")
+
+    async with manager.acquire(session_key, ProxySettings.direct()):
+        assert await manager.invalidate(session_key)
+
+    await factory.close_started.wait()
+    replacement_entered = asyncio.Event()
+
+    async def replacement_lease() -> None:
+        async with manager.acquire(session_key, ProxySettings.direct()):
+            replacement_entered.set()
+
+    replacement = asyncio.create_task(replacement_lease())
+    await next_turn()
+    calls_before_cleanup = len(factory.calls)
+    entered_before_cleanup = replacement_entered.is_set()
+
+    factory.allow_close.set()
+    await replacement
+
+    assert calls_before_cleanup == 1
+    assert not entered_before_cleanup
+    assert tracker.maximum == 1
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_expiry_blocks_same_key_replacement_until_cleanup_finishes() -> None:
+    tracker = LiveResourceTracker()
+    factory = TrackedFactory(tracker)
+    clock = FakeClock()
+    manager = SessionManager(factory, ttl_seconds=1, max_sessions=1, clock=clock)
+    session_key = key("account-a", "example.com")
+
+    async with manager.acquire(session_key, ProxySettings.direct()):
+        pass
+    clock.value = 1
+    expiring = asyncio.create_task(manager.expire_idle())
+    await factory.close_started.wait()
+    replacement_entered = asyncio.Event()
+
+    async def replacement_lease() -> None:
+        async with manager.acquire(session_key, ProxySettings.direct()):
+            replacement_entered.set()
+
+    replacement = asyncio.create_task(replacement_lease())
+    await next_turn()
+    calls_before_cleanup = len(factory.calls)
+    entered_before_cleanup = replacement_entered.is_set()
+
+    factory.allow_close.set()
+    assert await expiring == 1
+    await replacement
+
+    assert calls_before_cleanup == 1
+    assert not entered_before_cleanup
+    assert tracker.maximum == 1
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_capacity_counts_a_retiring_resource_until_cleanup_finishes() -> None:
+    tracker = LiveResourceTracker()
+    factory = TrackedFactory(tracker)
+    clock = FakeClock()
+    manager = SessionManager(factory, ttl_seconds=1, max_sessions=1, clock=clock)
+
+    async with manager.acquire(key("a", "one.example"), ProxySettings.direct()):
+        pass
+    clock.value = 1
+    expiring = asyncio.create_task(manager.expire_idle())
+    await factory.close_started.wait()
+
+    with pytest.raises(SessionCapacityError):
+        async with manager.acquire(key("b", "two.example"), ProxySettings.direct()):
+            pass
+
+    factory.allow_close.set()
+    assert await expiring == 1
+    assert len(factory.calls) == 1
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_retirement_already_removed_from_admission() -> None:
+    tracker = LiveResourceTracker()
+    factory = TrackedFactory(tracker)
+    clock = FakeClock()
+    manager = SessionManager(factory, ttl_seconds=1, clock=clock)
+
+    async with manager.acquire(key("a", "one.example"), ProxySettings.direct()):
+        pass
+    clock.value = 1
+    expiring = asyncio.create_task(manager.expire_idle())
+    await factory.close_started.wait()
+    close_started = asyncio.Event()
+    close_returned = asyncio.Event()
+
+    async def close_manager() -> None:
+        close_started.set()
+        await manager.close()
+        close_returned.set()
+
+    closing = asyncio.create_task(close_manager())
+    await close_started.wait()
+    await next_turn()
+    closed_before_cleanup = close_returned.is_set()
+
+    factory.allow_close.set()
+    await asyncio.gather(expiring, closing)
+
+    assert not closed_before_cleanup
+    assert tracker.live == 0
+
+
+@pytest.mark.asyncio
+async def test_close_observes_cleanup_error_from_existing_retirement() -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    resource = FakeResource(
+        "failing",
+        close_error=RuntimeError("cleanup failed"),
+        close_started=close_started,
+        allow_close=allow_close,
+    )
+    clock = FakeClock()
+    manager = SessionManager(FakeFactory([resource]), ttl_seconds=1, clock=clock)
+
+    async with manager.acquire(key("a", "one.example"), ProxySettings.direct()):
+        pass
+    clock.value = 1
+    expiring = asyncio.create_task(manager.expire_idle())
+    await close_started.wait()
+    closing = asyncio.create_task(manager.close())
+    await next_turn()
+    allow_close.set()
+    results = await asyncio.gather(expiring, closing, return_exceptions=True)
+
+    assert all(isinstance(result, RuntimeError) for result in results)
+    assert all("cleanup failed" in str(result) for result in results)
+
+
+@pytest.mark.asyncio
+async def test_reset_waits_for_matching_entry_already_retiring() -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    resource = FakeResource(
+        "blocked", close_started=close_started, allow_close=allow_close
+    )
+    clock = FakeClock()
+    manager = SessionManager(FakeFactory([resource]), ttl_seconds=1, clock=clock)
+
+    async with manager.acquire(key("account-a", "one.example"), ProxySettings.direct()):
+        pass
+    clock.value = 1
+    expiring = asyncio.create_task(manager.expire_idle())
+    await close_started.wait()
+    reset_returned = asyncio.Event()
+
+    async def reset_session() -> int:
+        result = await manager.reset("account-a")
+        reset_returned.set()
+        return result
+
+    resetting = asyncio.create_task(reset_session())
+    await next_turn()
+    returned_before_cleanup = reset_returned.is_set()
+
+    allow_close.set()
+    assert await expiring == 1
+    assert await resetting == 1
+    assert not returned_before_cleanup
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_open_timeout_cancels_open_and_keeps_cleanup_owned(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    factory = CancellingOpenFactory()
+    manager = SessionManager(factory, max_sessions=1, lifecycle_timeout_seconds=120)
+    session_key = key("account-a", "example.com")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="src.sessions"),
+        monkeypatch.context() as patch,
+    ):
+        patch.setattr(sessions, "_lifecycle_timeout", immediate_timeout)
+        with pytest.raises(sessions.SessionLifecycleTimeoutError):
+            async with manager.acquire(session_key, ProxySettings.direct()):
+                pass
+
+    await factory.cancelled.wait()
+    with pytest.raises(SessionCapacityError):
+        async with manager.acquire(key("b", "two.example"), ProxySettings.direct()):
+            pass
+
+    closing = asyncio.create_task(manager.close())
+    await next_turn()
+    assert not closing.done()
+
+    factory.allow_cleanup.set()
+    await factory.cleanup_finished.wait()
+    await closing
+    assert any(
+        getattr(record, "event", None) == "timeout"
+        and getattr(record, "reason", None) == "open"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_timeout_returns_stable_error_while_retirement_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    resource = FakeResource(
+        "blocked", close_started=close_started, allow_close=allow_close
+    )
+    manager = SessionManager(FakeFactory([resource]), lifecycle_timeout_seconds=120)
+    session_key = key("account-a", "example.com")
+
+    async with manager.acquire(session_key, ProxySettings.direct()):
+        pass
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sessions, "_lifecycle_timeout", immediate_timeout)
+        with pytest.raises(
+            sessions.SessionLifecycleTimeoutError,
+            match="browser session lifecycle timed out",
+        ):
+            await manager.reset("account-a")
+
+    await close_started.wait()
+    replacement_entered = asyncio.Event()
+
+    async def replacement_lease() -> None:
+        async with manager.acquire(session_key, ProxySettings.direct()):
+            replacement_entered.set()
+
+    replacement = asyncio.create_task(replacement_lease())
+    await next_turn()
+    assert not replacement_entered.is_set()
+
+    allow_close.set()
+    await replacement
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_timeout_is_retryable_without_cancelling_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    resource = FakeResource(
+        "blocked", close_started=close_started, allow_close=allow_close
+    )
+    manager = SessionManager(FakeFactory([resource]), lifecycle_timeout_seconds=120)
+
+    async with manager.acquire(key("account-a", "example.com"), ProxySettings.direct()):
+        pass
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sessions, "_lifecycle_timeout", immediate_timeout)
+        with pytest.raises(sessions.SessionLifecycleTimeoutError):
+            await manager.close()
+
+    await close_started.wait()
+    allow_close.set()
+    await manager.close()
+    assert resource.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_key_proxy_identity_mismatch_fails_closed() -> None:
+    factory = FakeFactory()
+    manager = SessionManager(factory)
+    configured = ProxySettings("http://one.proxy:8080", "one", "password-one")
+    supplied = ProxySettings("http://two.proxy:8080", "two", "password-two")
+
+    with pytest.raises(ValueError, match="proxy identity"):
+        async with manager.acquire(key("a", "example.com", configured), supplied):
+            pass
+
+    assert factory.calls == []
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_logging_never_runs_under_the_admission_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SessionManager(FakeFactory())
+    session_key = key("account-a", "example.com")
+    lock_states: list[bool] = []
+
+    def capture_log(*_args, **_kwargs) -> None:
+        lock_states.append(manager._map_lock.locked())  # noqa: SLF001
+
+    monkeypatch.setattr(sessions, "log_session_event", capture_log)
+    async with manager.acquire(session_key, ProxySettings.direct()):
+        pass
+    async with manager.acquire(session_key, ProxySettings.direct()):
+        pass
+    assert await manager.reset("account-a") == 1
+    await manager.close()
+
+    assert lock_states
+    assert not any(lock_states)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_logs_distinguish_every_ownership_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    manager = SessionManager(FakeFactory(), ttl_seconds=1, max_sessions=1, clock=clock)
+    events: list[str] = []
+
+    def capture_log(_level, event: str, *_args, **_kwargs) -> None:
+        events.append(event)
+
+    monkeypatch.setattr(sessions, "log_session_event", capture_log)
+    first = key("a", "one.example")
+    async with manager.acquire(first, ProxySettings.direct()):
+        pass
+    async with manager.acquire(first, ProxySettings.direct()):
+        pass
+    async with manager.acquire(key("b", "two.example"), ProxySettings.direct()):
+        pass
+    clock.value = 1
+    assert await manager.expire_idle() == 1
+    async with manager.acquire(key("c", "three.example"), ProxySettings.direct()):
+        pass
+    assert await manager.reset("c") == 1
+    fourth = key("d", "four.example")
+    async with manager.acquire(fourth, ProxySettings.direct()):
+        assert await manager.invalidate(fourth)
+    async with manager.acquire(key("e", "five.example"), ProxySettings.direct()):
+        pass
+    await manager.close()
+
+    assert {
+        "create",
+        "reuse",
+        "expire",
+        "reset",
+        "evict",
+        "invalidate",
+        "shutdown",
+    }.issubset(events)
 
 
 @pytest.mark.asyncio
