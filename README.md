@@ -7,6 +7,11 @@
 > [!IMPORTANT]
 > This software does not **guarantee** (only greatly increases the chance) that any challenge will be bypassed. While this tool passes the initial browser check, Cloudflare and other captcha providers likely require valid network traffic originating from the user’s public IP address to mark a connection as legitimate. If any website does not pass the challenge, please run troubleshooting steps and check if other websites work before you create an GitHub issue.
 
+This is the [TechnoBeceT-maintained fork](https://github.com/TechnoBeceT/Byparr) of
+[Byparr](https://github.com/ThePhaseless/Byparr), distributed under the
+[GNU GPLv3](LICENSE). It includes local modifications and is not an official
+upstream image or endorsement.
+
 ## Options
 
 | Environment Variable | Default   | Description                                                                                                                                                       |
@@ -18,6 +23,9 @@
 | `PROXY_PASSWORD`     | None      | Password for proxy authentication.                                                                                                                                |
 | `OWUI_API_KEY`       | None      | Bearer token for `/load` endpoint authentication. Must match `EXTERNAL_WEB_LOADER_API_KEY` in Open WebUI.                                                         |
 | `BROWSER_LOCALE`     | None      | Override the browser's language with a [BCP-47](https://www.rfc-editor.org/rfc/bcp/bcp47.txt) tag, e.g. `en-US`, `de-DE`, `fr-FR`. When unset, the locale is derived from the egress country. |
+| `SESSION_TTL_SECONDS` | `900` | Idle lifetime for a retained browser session. Minimum `1`. |
+| `SESSION_MAX_SESSIONS` | `8` | Maximum retained browser sessions. Minimum `1`. |
+| `SESSION_LIFECYCLE_TIMEOUT_SECONDS` | `120` | Deadline in seconds for a retained session's browser lifecycle work (opening, retiring, or waiting for replacement). Minimum `1`. |
 
 #### Browser language
 
@@ -31,9 +39,14 @@ Recently I've partnered with a _new in town_ proxy service - ProxyBase - to offe
 
 ## Tags
 
-- `v*.*.*`/`latest` - Releases considered stable
-- `main` - Latest release from main branch (untested)
-- `pr-{number}` - Pull request images for testing (automatically cleaned up when PR closes)
+- `v*`/`latest` - Releases published by this fork from version tags
+- `sha-...` - Immutable image reference produced by a manual publish
+
+The fork's images are published as `ghcr.io/technobecet/byparr`. The image
+contains this repository's GPLv3 `LICENSE`; its OCI source label links to the
+[corresponding fork source](https://github.com/TechnoBeceT/Byparr). Pull
+requests and ordinary branch pushes build and test only; they never publish an
+image.
 
 ## Usage
 
@@ -54,7 +67,7 @@ docker compose up -d
 1. Pull and run the image:
 
    ```bash
-   docker run -p 8191:8191 ghcr.io/thephaseless/byparr:latest
+   docker run -p 8191:8191 ghcr.io/technobecet/byparr:latest
    ```
 
 2. Optional: set env vars using `-e` or `--env-file`.
@@ -72,6 +85,93 @@ Once running, open:
 
 - `http://localhost:8191/docs`
 - `http://localhost:8191/` (redirects to `/docs`)
+
+### Named browser sessions
+
+`request.get` remains disposable by default: omit `session`, or pass an empty
+or whitespace-only value, to get a new browser context for that request. Add a
+non-blank session name when a site needs cookies or other browser state to
+survive across requests:
+
+```bash
+curl -X POST http://localhost:8191/v1 \
+  -H 'content-type: application/json' \
+  -d '{"cmd":"request.get","url":"https://example.com/account","session":"my-account"}'
+```
+
+The returned navigation envelope remains FlareSolverr-compatible:
+
+```json
+{
+  "status": "ok",
+  "message": "Success",
+  "solution": {
+    "url": "https://example.com/account",
+    "status": 200,
+    "cookies": [],
+    "userAgent": "...",
+    "headers": {},
+    "response": "...",
+    "contentType": "text/html"
+  },
+  "startTimestamp": 0,
+  "endTimestamp": 0,
+  "version": "..."
+}
+```
+
+For retained requests, the isolation key is the configured session name, the
+target's registrable domain, and the proxy egress identity. For example,
+`reader.example.com` and `api.example.com` share a named session, while a
+different registrable domain or proxy does not. Only one request may use an
+individual key at once; requests for different keys can proceed concurrently.
+
+Create is a lazy, idempotent declaration: it validates the name but opens no
+browser until the first matching `request.get`.
+
+```bash
+curl -X POST http://localhost:8191/v1 \
+  -H 'content-type: application/json' \
+  -d '{"cmd":"sessions.create","session":"my-account"}'
+```
+
+```json
+{
+  "status": "ok",
+  "message": "Session created successfully.",
+  "session": "my-account",
+  "startTimestamp": 0,
+  "endTimestamp": 0,
+  "version": "..."
+}
+```
+
+Destroy is also idempotent. It resets every retained domain and proxy entry
+for the exact normalized configured name:
+
+```bash
+curl -X POST http://localhost:8191/v1 \
+  -H 'content-type: application/json' \
+  -d '{"cmd":"sessions.destroy","session":"my-account"}'
+```
+
+```json
+{
+  "status": "ok",
+  "message": "The session has been removed.",
+  "startTimestamp": 0,
+  "endTimestamp": 0,
+  "version": "..."
+}
+```
+
+Retained sessions consume one browser context per isolation key. Idle entries
+are evicted least-recently-used when capacity is needed and expire after
+`SESSION_TTL_SECONDS`. If every retained entry is busy, a new key receives
+HTTP `503` with `{"detail":"Browser session capacity is unavailable"}`.
+Sessions survive requests but never process or container restarts. Session
+names, cookie values, and proxy credentials are not persisted, and they are
+not logged in plaintext.
 
 ### Open WebUI Integration
 

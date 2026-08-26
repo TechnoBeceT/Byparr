@@ -1,234 +1,95 @@
-name: Docker
-
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
+name: Container image
 
 on:
-  schedule:
-    - cron: "25 0 * * *"
   push:
-    branches: ["main"]
-    # Publish semver tags as releases.
-    tags: ["v*.*.*"]
-    paths:
-      - "src/**"
-      - "main.py"
-      - "tests/**"
-      - "Dockerfile"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "compose.yaml"
-      - ".github/workflows/docker-publish.yml"
+    tags: ["v*"]
   pull_request:
-    branches: ["main"]
-    paths:
-      - "src/**"
-      - "main.py"
-      - "tests/**"
-      - "Dockerfile"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "compose.yaml"
-      - ".github/workflows/docker-publish.yml"
   workflow_dispatch:
-
-env:
-  # Use docker.io for Docker Hub if empty
-  REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
-  IMAGE_NAME: ${{ github.repository }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/technobecet/byparr
 
 jobs:
   test:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      id-token: write
 
     steps:
-      - name: Checkout repository
+      - name: Check out source
         uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Test
-        id: test
+      - name: Build and test the shipped environment
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64
-          cache-from: type=gha,scope=amd64
-          pull: true
-          cache-to: type=gha,mode=max,scope=amd64
           target: test
-          build-args: |
-            GITHUB_BUILD=true
+          platforms: linux/amd64
+          pull: true
+          cache-from: type=gha,scope=test-amd64
+          cache-to: type=gha,mode=max,scope=test-amd64
 
-  build:
+  publish:
     needs: test
-    # Skip build for Renovate PRs
-    if: github.event.pull_request.user.login != 'renovate[bot]'
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      id-token: write
-
-    strategy:
-      matrix:
-        platform: [linux/amd64, linux/arm64]
 
     steps:
-      - name: Checkout repository
+      - name: Check out source
         uses: actions/checkout@v7
-
-      - name: Prepare variables
-        id: vars
-        run: |
-          SURFIX=$(echo ${{ matrix.platform }} | cut -d'/' -f2)
-          echo "SURFIX=$SURFIX" >> $GITHUB_OUTPUT
-
-          # Use PR number for PRs, SHA for everything else
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            echo "LOCAL_TAG=pr-${{ github.event.pull_request.number }}-$SURFIX" >> $GITHUB_OUTPUT
-          else
-            echo "LOCAL_TAG=${{ github.sha }}-$SURFIX" >> $GITHUB_OUTPUT
-          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
-      # Set up BuildKit Docker container builder
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # Log into registry
-      - name: Log into registry ${{ env.REGISTRY }}
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Extract metadata (tags, labels) for Docker
-      - name: Extract Docker metadata
+      - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
-          tags: type=raw,value=${{ steps.vars.outputs.LOCAL_TAG }}
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,prefix=sha-
+          labels: |
+            org.opencontainers.image.source=https://github.com/TechnoBeceT/Byparr
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+            org.opencontainers.image.title=Byparr
+            org.opencontainers.image.description=Modified TechnoBeceT fork of Byparr
 
-      # Build and push Docker image for each platform
-      - name: Build Docker image
-        id: build
+      - name: Build and publish production image
         uses: docker/build-push-action@v7
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           pull: true
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: ${{ matrix.platform }}
-          cache-from: type=gha,scope=${{ steps.vars.outputs.SURFIX }}
-          cache-to: type=gha,mode=max,scope=${{ steps.vars.outputs.SURFIX }}
+          cache-from: type=gha,scope=production
+          cache-to: type=gha,mode=max,scope=production
           build-args: |
             GITHUB_BUILD=true
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
-
-  merge-and-push:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      # Install the cosign tool
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.2
-
-      # Set up Docker Buildx
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      # Log into registry
-      - name: Log into registry ${{ env.REGISTRY }}
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Extract Docker metadata for tagging
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-
-      # Create manifest lists and push
-      - name: Create and push manifest lists
-        id: manifests
-        run: |
-          TAGS="${{ steps.meta.outputs.tags }}"
-          args=""
-
-          image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          image=${image,,}
-
-          # Create tag arguments
-          for tag in $TAGS; do
-              args="$args -t $tag"
-          done
-
-          if [ "${{ github.ref_type }}" == "tag" ]; then
-            args="$args -t ${image}:latest"
-          fi
-
-          echo $args
-
-          # Use PR-based tags for PRs, SHA-based tags for everything else
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            docker buildx imagetools create $args \
-            ${image}:pr-${{ github.event.pull_request.number }}-amd64 \
-            ${image}:pr-${{ github.event.pull_request.number }}-arm64
-          else
-            docker buildx imagetools create $args \
-            ${image}:${{github.sha}}-amd64 \
-            ${image}:${{github.sha}}-arm64
-          fi
-
-          # All tags created above alias a single manifest list; capture its digest
-          # so the signature is bound to the image bytes, not a mutable tag.
-          # Tags from metadata-action are full references (image:tag), one per line,
-          # so take the first line rather than splitting on spaces.
-          FIRST_TAG=$(printf '%s' "$TAGS" | head -n1)
-          DIGEST=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$FIRST_TAG")
-          echo "DIGEST=$DIGEST" >> $GITHUB_OUTPUT
-
-      # Sign the manifest list by digest — every consumer tag aliases this digest
-      - name: Sign the manifest list by digest
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          DIGEST: ${{ steps.manifests.outputs.DIGEST }}
-        run: |
-          image=${IMAGE,,}
-          cosign sign --yes ${image}@${DIGEST}
