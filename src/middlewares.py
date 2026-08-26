@@ -1,7 +1,9 @@
 import time
 from http import HTTPStatus
+from json import JSONDecodeError
 
 from fastapi import Request
+from pydantic import ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from src.models import LinkRequest
@@ -15,7 +17,10 @@ class LogRequest(BaseHTTPMiddleware):
             return await call_next(request)
 
         start_time = time.perf_counter()
-        request_body = LinkRequest.model_validate(await request.json())
+        try:
+            request_body = LinkRequest.model_validate(await request.json())
+        except JSONDecodeError, ValidationError:
+            return await call_next(request)
         logger.info(
             f"From: {request.client.host if request.client else 'unknown'} at {time.strftime('%Y-%m-%d %H:%M:%S')}: {request_body.url}"
         )

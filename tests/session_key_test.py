@@ -88,6 +88,21 @@ def test_session_key_uses_uts46_idna_canonicalization() -> None:
     assert unicode_key != ascii_key
 
 
+@pytest.mark.parametrize(
+    ("url", "expected_site"),
+    [
+        ("https://127.0.0.1/chapter/1", "127.0.0.1"),
+        ("https://[::1]/chapter/1", "::1"),
+        ("https://[2001:0db8::1]/chapter/1", "2001:db8::1"),
+    ],
+)
+def test_session_key_normalizes_ip_literal_sites(url: str, expected_site: str) -> None:
+    key = build_session_key("account-a", url, ProxySettings.direct())
+
+    assert key is not None
+    assert key.site == expected_site
+
+
 def test_session_key_isolated_by_proxy_egress() -> None:
     direct = build_session_key(
         "account-a", "https://example.com", ProxySettings.direct()
