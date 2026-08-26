@@ -3,7 +3,7 @@ import warnings
 from http import HTTPStatus
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -14,12 +14,14 @@ from src.models import (
     HealthcheckResponse,
     LinkRequest,
     LinkResponse,
+    SessionResponse,
     Solution,
 )
 from src.utils import (
     BrowserDepClass,
     TimeoutTimer,
     get_browser,
+    get_request_browser,
     logger,
     remaining_ms,
 )
@@ -56,9 +58,8 @@ async def health_check(sb: BrowserDep):
     return HealthcheckResponse(user_agent=health_check_request.solution.user_agent)
 
 
-@router.post("/v1")
-async def read_item(request: LinkRequest, dep: BrowserDep) -> LinkResponse:
-    """Handle POST requests."""
+async def read_item(request: LinkRequest, dep: BrowserDepClass) -> LinkResponse:
+    """Navigate one browser resource and return the FlareSolverr response."""
     start_time = int(time.time() * 1000)
     timer = TimeoutTimer(duration=request.max_timeout)
     request.url = request.url.replace('"', "").strip()
@@ -108,6 +109,30 @@ async def read_item(request: LinkRequest, dep: BrowserDep) -> LinkResponse:
         ),
         start_timestamp=start_time,
     )
+
+
+@router.post("/v1")
+async def handle_v1(
+    request: LinkRequest,
+    app_request: Request,
+    x_proxy_server: Annotated[str | None, Header(alias="X-Proxy-Server")] = None,
+    x_proxy_username: Annotated[str | None, Header(alias="X-Proxy-Username")] = None,
+    x_proxy_password: Annotated[str | None, Header(alias="X-Proxy-Password")] = None,
+) -> LinkResponse | SessionResponse:
+    """Select the request browser lifecycle before running navigation."""
+    if request.cmd == "sessions.create":
+        return SessionResponse(message="Session created successfully.")
+    if request.cmd == "sessions.destroy":
+        await app_request.app.state.session_manager.reset(request.session)
+        return SessionResponse(message="The session has been removed.")
+    async with get_request_browser(
+        request,
+        getattr(app_request.app.state, "session_manager", None),
+        x_proxy_server=x_proxy_server,
+        x_proxy_username=x_proxy_username,
+        x_proxy_password=x_proxy_password,
+    ) as dep:
+        return await read_item(request, dep)
 
 
 async def setup_routes(request: LinkRequest, dep: BrowserDep) -> None:

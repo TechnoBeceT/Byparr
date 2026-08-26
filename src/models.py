@@ -2,24 +2,25 @@ from __future__ import annotations
 
 import time
 from http.client import INTERNAL_SERVER_ERROR
-from typing import Any
+from typing import Any, Literal
 
 from playwright.sync_api import Cookie
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 from src import consts
 
 MS_PER_SECOND = 1000
 SESSION_PRINTABLE_MESSAGE = "session must contain printable characters only"
+SESSION_REQUIRED_MESSAGE = "session is required for session commands"
 
 
 class LinkRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
-    cmd: str = Field(
+    cmd: Literal["request.get", "sessions.create", "sessions.destroy"] = Field(
         default="request.get",
-        description="Type of request, currently only supports GET requests. This string is purely for compatibility with FlareSolverr.",
+        description="FlareSolverr-compatible request or session command.",
     )
     url: str = Field(pattern=r"^https?://", default="https://")
     max_timeout: int = Field(
@@ -68,6 +69,13 @@ class LinkRequest(BaseModel):
             return value // MS_PER_SECOND
         return value
 
+    @model_validator(mode="after")
+    def require_session_for_session_commands(self) -> LinkRequest:
+        """Require the normalized session name for non-navigation commands."""
+        if self.cmd != "request.get" and self.session is None:
+            raise ValueError(SESSION_REQUIRED_MESSAGE)
+        return self
+
 
 class HealthcheckResponse(BaseModel):
     model_config = {"alias_generator": to_camel, "populate_by_name": True}
@@ -109,3 +117,14 @@ class LinkResponse(BaseModel):
             solution=Solution(url=url, status=INTERNAL_SERVER_ERROR),
             start_timestamp=int(time.time() * 1000),
         )
+
+
+class SessionResponse(BaseModel):
+    """FlareSolverr-compatible envelope for session commands."""
+
+    model_config = {"alias_generator": to_camel, "populate_by_name": True}
+    status: str = "ok"
+    message: str
+    start_timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
+    end_timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
+    version: str = consts.VERSION

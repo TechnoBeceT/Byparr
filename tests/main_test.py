@@ -1,4 +1,8 @@
+# ruff: noqa: D102, D107, PLC0415, PLR2004, TRY003
+
+import asyncio
 import base64
+from contextlib import asynccontextmanager
 from http import HTTPStatus
 from json import JSONDecodeError
 from unittest.mock import AsyncMock, MagicMock
@@ -8,12 +12,14 @@ import pytest
 from fastapi import HTTPException
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from pydantic import ValidationError
 from starlette.testclient import TestClient
 
-from main import app
+from main import app, lifespan
 from src.challenge import CF_INTERSTITIAL_INDICATORS_SELECTORS
 from src.endpoints import read_item
 from src.models import LinkRequest
+from src.sessions import SessionCapacityError
 from src.utils import BrowserDepClass, TimeoutTimer, remaining_ms
 
 client = TestClient(app)
@@ -187,6 +193,290 @@ def fake_dep(
     context = AsyncMock()
     context.cookies.return_value = []
     return BrowserDepClass(page=page, context=context)
+
+
+class EndpointResource:
+    """A disposable browser resource with a stable cookie per context."""
+
+    def __init__(self, number: int) -> None:
+        self.page = fake_dep().page
+        self.context = fake_dep().context
+        self.context.cookies.return_value = [
+            {
+                "name": "browser",
+                "value": str(number),
+                "domain": "example.test",
+                "path": "/",
+                "expires": -1,
+                "httpOnly": False,
+                "secure": False,
+                "sameSite": "Lax",
+            }
+        ]
+        self.close = AsyncMock()
+
+
+class EndpointFactory:
+    """Create inspectable browser resources for HTTP endpoint tests."""
+
+    def __init__(self) -> None:
+        self.resources: list[EndpointResource] = []
+
+    async def open(self, _proxy: object) -> EndpointResource:
+        resource = EndpointResource(len(self.resources) + 1)
+        self.resources.append(resource)
+        return resource
+
+
+class RejectingSessionManager:
+    """Model a saturated retained-session manager at the HTTP boundary."""
+
+    @asynccontextmanager
+    async def acquire(self, _key: object, _proxy: object):
+        raise SessionCapacityError
+        yield  # pragma: no cover
+
+
+class RecordingSessionManager:
+    """Record session reset calls without opening a retained browser."""
+
+    def __init__(self) -> None:
+        self.reset_calls: list[str] = []
+        self.acquire_calls = 0
+
+    @asynccontextmanager
+    async def acquire(self, _key: object, _proxy: object):
+        self.acquire_calls += 1
+        raise AssertionError("session command must not acquire a browser")
+        yield  # pragma: no cover
+
+    async def reset(self, session: str) -> int:
+        self.reset_calls.append(session)
+        return 2
+
+
+def test_named_session_reuses_its_site_but_isolates_other_sites(monkeypatch):
+    """A same-site session keeps its context and a different site gets another."""
+    from src import utils
+
+    factory = EndpointFactory()
+    monkeypatch.setattr(utils, "BrowserFactory", lambda: factory)
+    monkeypatch.setattr("main.BrowserFactory", lambda: factory)
+
+    with TestClient(app) as test_client:
+        first = test_client.post(
+            "/v1",
+            json={
+                "cmd": "request.get",
+                "url": "https://one.example.com/a",
+                "session": "account",
+            },
+        )
+        second = test_client.post(
+            "/v1",
+            json={
+                "cmd": "request.get",
+                "url": "https://two.example.com/b",
+                "session": "account",
+            },
+        )
+        other_site = test_client.post(
+            "/v1",
+            json={
+                "cmd": "request.get",
+                "url": "https://example.org/test",
+                "session": "account",
+            },
+        )
+
+    assert first.status_code == HTTPStatus.OK
+    assert second.status_code == HTTPStatus.OK
+    assert other_site.status_code == HTTPStatus.OK
+    assert first.json()["solution"]["cookies"] == second.json()["solution"]["cookies"]
+    assert (
+        first.json()["solution"]["cookies"] != other_site.json()["solution"]["cookies"]
+    )
+    assert len(factory.resources) == 2
+    assert [resource.close.await_count for resource in factory.resources] == [1, 1]
+
+
+def test_blank_sessions_remain_disposable(monkeypatch):
+    """Blank session declarations never retain a browser context."""
+    from src import utils
+
+    factory = EndpointFactory()
+    monkeypatch.setattr(utils, "BrowserFactory", lambda: factory)
+    monkeypatch.setattr("main.BrowserFactory", lambda: factory)
+
+    with TestClient(app) as test_client:
+        first = test_client.post("/v1", json={"url": "https://example.test/one"})
+        second = test_client.post(
+            "/v1", json={"url": "https://example.test/two", "session": "   "}
+        )
+
+    assert first.status_code == HTTPStatus.OK
+    assert second.status_code == HTTPStatus.OK
+    assert len(factory.resources) == 2
+    assert [resource.close.await_count for resource in factory.resources] == [1, 1]
+
+
+def test_retained_session_capacity_overload_is_a_stable_503(monkeypatch):
+    """A saturated named-session pool fails without disclosing session details."""
+    from src import utils
+
+    factory = EndpointFactory()
+    monkeypatch.setattr(utils, "BrowserFactory", lambda: factory)
+    monkeypatch.setattr("main.BrowserFactory", lambda: factory)
+
+    with TestClient(app) as test_client:
+        app.state.session_manager = RejectingSessionManager()
+        response = test_client.post(
+            "/v1",
+            json={"url": "https://example.test/one", "session": "private-account"},
+        )
+
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json() == {"detail": "Browser session capacity is unavailable"}
+
+
+def test_session_commands_require_a_normalized_session_name():
+    """Create and destroy reject a missing or blank session before dispatch."""
+    for command in ("sessions.create", "sessions.destroy"):
+        with pytest.raises(ValidationError, match="session is required"):
+            LinkRequest.model_validate({"cmd": command, "session": "  "})
+
+
+def test_link_request_rejects_commands_outside_the_flaresolverr_set():
+    """Unsupported commands cannot silently run a navigation request."""
+    with pytest.raises(ValidationError):
+        LinkRequest.model_validate(
+            {"cmd": "sessions.list", "url": "https://example.test"}
+        )
+
+
+def test_session_create_is_a_lazy_idempotent_declaration(monkeypatch):
+    """Repeated creates succeed without asking the browser factory for a context."""
+    from src import utils
+
+    factory = EndpointFactory()
+    manager = RecordingSessionManager()
+    monkeypatch.setattr(utils, "BrowserFactory", lambda: factory)
+    monkeypatch.setattr("main.BrowserFactory", lambda: factory)
+
+    with TestClient(app) as test_client:
+        app.state.session_manager = manager
+        first = test_client.post(
+            "/v1", json={"cmd": "sessions.create", "session": " account "}
+        )
+        second = test_client.post(
+            "/v1", json={"cmd": "sessions.create", "session": "account"}
+        )
+
+    assert first.status_code == HTTPStatus.OK
+    assert second.status_code == HTTPStatus.OK
+    assert first.json()["message"] == "Session created successfully."
+    assert second.json()["message"] == "Session created successfully."
+    assert "solution" not in first.json()
+    assert factory.resources == []
+    assert manager.acquire_calls == 0
+
+
+def test_session_destroy_resets_every_exact_normalized_name_idempotently(monkeypatch):
+    """Destroy closes every site for its exact name and stays idempotent."""
+    from src import utils
+
+    factory = EndpointFactory()
+    monkeypatch.setattr(utils, "BrowserFactory", lambda: factory)
+    monkeypatch.setattr("main.BrowserFactory", lambda: factory)
+
+    with TestClient(app) as test_client:
+        first_site = test_client.post(
+            "/v1",
+            json={
+                "url": "https://example.com/one",
+                "session": "account",
+            },
+        )
+        second_site = test_client.post(
+            "/v1",
+            json={
+                "url": "https://example.org/two",
+                "session": "account",
+            },
+        )
+        other_name = test_client.post(
+            "/v1",
+            json={
+                "url": "https://example.net/three",
+                "session": "other-account",
+            },
+        )
+        first = test_client.post(
+            "/v1", json={"cmd": "sessions.destroy", "session": " account "}
+        )
+        second = test_client.post(
+            "/v1", json={"cmd": "sessions.destroy", "session": "account"}
+        )
+
+        assert first_site.status_code == HTTPStatus.OK
+        assert second_site.status_code == HTTPStatus.OK
+        assert other_name.status_code == HTTPStatus.OK
+        assert [resource.close.await_count for resource in factory.resources] == [
+            1,
+            1,
+            0,
+        ]
+
+    assert first.status_code == HTTPStatus.OK
+    assert second.status_code == HTTPStatus.OK
+    assert first.json()["message"] == "The session has been removed."
+    assert second.json()["message"] == "The session has been removed."
+
+
+def test_health_check_uses_a_disposable_browser_not_the_session_manager(monkeypatch):
+    """Health checks cannot create a retained entry because they have no session key."""
+    from src import utils
+
+    factory = EndpointFactory()
+    manager = RecordingSessionManager()
+    monkeypatch.setattr(utils, "BrowserFactory", lambda: factory)
+    monkeypatch.setattr("main.BrowserFactory", lambda: factory)
+
+    with TestClient(app) as test_client:
+        app.state.session_manager = manager
+        response = test_client.get("/health")
+
+    assert response.status_code == HTTPStatus.OK
+    assert len(factory.resources) == 1
+    factory.resources[0].close.assert_awaited_once()
+    assert manager.acquire_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_lifespan_cancels_expiry_before_closing_the_session_manager(monkeypatch):
+    """Shutdown awaits expiry-task cancellation before retained resources close."""
+    events: list[str] = []
+
+    class LifecycleManager:
+        async def close(self) -> None:
+            assert events == ["expiry-cancelled"]
+            events.append("manager-closed")
+
+    manager = LifecycleManager()
+
+    async def wait_for_cancellation(_manager: LifecycleManager) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("expiry-cancelled")
+
+    monkeypatch.setattr("main.SessionManager", lambda _factory: manager)
+    monkeypatch.setattr("main.expire_idle_sessions", wait_for_cancellation)
+
+    async with lifespan(app):
+        await asyncio.sleep(0)
+
+    assert events == ["expiry-cancelled", "manager-closed"]
 
 
 @pytest.mark.asyncio

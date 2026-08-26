@@ -1,9 +1,10 @@
 import logging
 import time
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Header
+from fastapi import Header, HTTPException
 from pydantic import BaseModel, Field
 
 from src.browser import BrowserDepClass, BrowserFactory
@@ -14,6 +15,13 @@ from src.consts import (
     PROXY_USERNAME,
 )
 from src.proxy import resolve_proxy_settings
+from src.session_key import build_session_key
+from src.sessions import SessionCapacityError, SessionManager
+
+SESSION_CAPACITY_MESSAGE = "Browser session capacity is unavailable"
+SESSION_LIFESPAN_REQUIRED_MESSAGE = (
+    "named browser sessions require application lifespan"
+)
 
 solver_logger = logging.getLogger("playwright_captcha")
 solver_logger.handlers.clear()
@@ -81,3 +89,38 @@ async def get_browser(
         yield BrowserDepClass(resource.page, resource.context)
     finally:
         await resource.close()
+
+
+@asynccontextmanager
+async def get_request_browser(
+    request,
+    manager: SessionManager | None,
+    *,
+    x_proxy_server: str | None = None,
+    x_proxy_username: str | None = None,
+    x_proxy_password: str | None = None,
+) -> AsyncGenerator[BrowserDepClass]:
+    """Acquire a disposable or retained browser for a FlareSolverr request."""
+    proxy = resolve_proxy_settings(
+        header_server=x_proxy_server,
+        header_username=x_proxy_username,
+        header_password=x_proxy_password,
+        environment_server=PROXY_SERVER,
+        environment_username=PROXY_USERNAME,
+        environment_password=PROXY_PASSWORD,
+    )
+    key = build_session_key(request.session, request.url, proxy)
+    if key is None:
+        resource = await BrowserFactory().open(proxy)
+        try:
+            yield BrowserDepClass(resource.page, resource.context)
+        finally:
+            await resource.close()
+        return
+    if manager is None:
+        raise RuntimeError(SESSION_LIFESPAN_REQUIRED_MESSAGE)
+    try:
+        async with manager.acquire(key, proxy) as browser:
+            yield browser
+    except SessionCapacityError as error:
+        raise HTTPException(status_code=503, detail=SESSION_CAPACITY_MESSAGE) from error
