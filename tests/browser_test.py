@@ -15,8 +15,18 @@ class FakePage:
 
 
 class FakeContext:
-    def __init__(self, *, page_error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        page_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+        close_started: asyncio.Event | None = None,
+        allow_close: asyncio.Event | None = None,
+    ) -> None:
         self.page_error = page_error
+        self.close_error = close_error
+        self.close_started = close_started
+        self.allow_close = allow_close
         self.page = FakePage()
         self.close_calls = 0
 
@@ -27,6 +37,12 @@ class FakeContext:
 
     async def close(self) -> None:
         self.close_calls += 1
+        if self.close_started is not None:
+            self.close_started.set()
+        if self.allow_close is not None:
+            await self.allow_close.wait()
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FakeBrowser:
@@ -47,15 +63,28 @@ class FakeBrowser:
 
 
 class FakePlaywrightScope:
-    def __init__(self, browser: FakeBrowser) -> None:
+    def __init__(
+        self,
+        browser: FakeBrowser | None = None,
+        *,
+        enter_error: BaseException | None = None,
+        exit_error: BaseException | None = None,
+    ) -> None:
         self.browser = browser
+        self.enter_error = enter_error
+        self.exit_error = exit_error
         self.exit_calls = 0
 
     async def __aenter__(self) -> FakeBrowser:
+        if self.enter_error is not None:
+            raise self.enter_error
+        assert self.browser is not None
         return self.browser
 
     async def __aexit__(self, *args: object) -> None:
         self.exit_calls += 1
+        if self.exit_error is not None:
+            raise self.exit_error
 
 
 class FakeBrowserFactory:
@@ -109,6 +138,20 @@ async def test_browser_factory_exits_scope_when_context_creation_fails() -> None
 
 
 @pytest.mark.asyncio
+async def test_browser_factory_exits_scope_when_entry_fails_and_preserves_entry_error() -> (
+    None
+):
+    scope = FakePlaywrightScope(
+        enter_error=RuntimeError("entry"), exit_error=RuntimeError("cleanup")
+    )
+
+    with pytest.raises(RuntimeError, match="entry"):
+        await make_factory(scope).open(ProxySettings.direct())
+
+    assert scope.exit_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_browser_factory_closes_context_and_exits_scope_when_page_creation_fails() -> (
     None
 ):
@@ -117,6 +160,73 @@ async def test_browser_factory_closes_context_and_exits_scope_when_page_creation
 
     with pytest.raises(RuntimeError, match="page"):
         await make_factory(scope).open(ProxySettings.direct())
+
+    assert context.close_calls == 1
+    assert scope.exit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_browser_resource_closers_wait_for_one_shared_cleanup() -> (
+    None
+):
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    context = FakeContext(close_started=close_started, allow_close=allow_close)
+    scope = FakePlaywrightScope(FakeBrowser(context=context))
+    resource = await make_factory(scope).open(ProxySettings.direct())
+
+    first_closer = asyncio.create_task(resource.close())
+    await close_started.wait()
+    second_closer = asyncio.create_task(resource.close())
+    await asyncio.sleep(0)
+
+    assert not first_closer.done()
+    assert not second_closer.done()
+
+    allow_close.set()
+    await asyncio.gather(first_closer, second_closer)
+
+    assert context.close_calls == 1
+    assert scope.exit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_browser_resource_closer_does_not_cancel_shared_cleanup() -> (
+    None
+):
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    context = FakeContext(close_started=close_started, allow_close=allow_close)
+    scope = FakePlaywrightScope(FakeBrowser(context=context))
+    resource = await make_factory(scope).open(ProxySettings.direct())
+
+    cancelled_closer = asyncio.create_task(resource.close())
+    await close_started.wait()
+    cancelled_closer.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_closer
+
+    assert context.close_calls == 1
+    assert scope.exit_calls == 0
+
+    allow_close.set()
+    await resource.close()
+
+    assert context.close_calls == 1
+    assert scope.exit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_resource_replays_shared_cleanup_error_to_later_closers() -> None:
+    context = FakeContext(close_error=RuntimeError("context cleanup"))
+    scope = FakePlaywrightScope(FakeBrowser(context=context))
+    resource = await make_factory(scope).open(ProxySettings.direct())
+
+    with pytest.raises(RuntimeError, match="context cleanup"):
+        await resource.close()
+    with pytest.raises(RuntimeError, match="context cleanup"):
+        await resource.close()
 
     assert context.close_calls == 1
     assert scope.exit_calls == 1

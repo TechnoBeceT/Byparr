@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
@@ -21,17 +22,23 @@ class BrowserResource:
     page: Page
     context: BrowserContext
     _scope: AbstractAsyncContextManager[Browser] = field(repr=False)
-    _closed: bool = field(default=False, init=False, repr=False)
+    _close_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     async def close(self) -> None:
-        """Close this context and exit its InvisiblePlaywright scope once."""
-        if self._closed:
-            return
-        self._closed = True
+        """Await the one shared cleanup task, replaying any cleanup error."""
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_owned())
+        await asyncio.shield(self._close_task)
+
+    async def _close_owned(self) -> None:
+        """Close resources once; a context error takes precedence over an exit error."""
         try:
             await self.context.close()
-        finally:
-            await self._scope.__aexit__(None, None, None)
+        except BaseException:
+            with suppress(BaseException):
+                await self._scope.__aexit__(None, None, None)
+            raise
+        await self._scope.__aexit__(None, None, None)
 
 
 class BrowserFactory:
@@ -59,7 +66,11 @@ class BrowserFactory:
                 "browser.tabs.remote.useCrossOriginEmbedderPolicy": False,
             },
         )
-        browser = cast("Browser", await scope.__aenter__())
+        try:
+            browser = cast("Browser", await scope.__aenter__())
+        except BaseException as error:
+            await self._close_after_open_failure(scope, None, error)
+            raise
         context: BrowserContext | None = None
         try:
             context = await browser.new_context()
