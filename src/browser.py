@@ -6,13 +6,20 @@ import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from invisible_playwright.async_api import InvisiblePlaywright
 from playwright.async_api import Browser, BrowserContext, Page
 
 from src.consts import BROWSER_LOCALE
 from src.proxy import ProxySettings
+
+
+class BrowserDepClass(NamedTuple):
+    """The page and context exposed to request handlers."""
+
+    page: Page
+    context: BrowserContext
 
 
 @dataclass

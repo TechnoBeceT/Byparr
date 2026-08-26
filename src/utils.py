@@ -1,13 +1,12 @@
 import logging
 import time
 from collections.abc import AsyncGenerator
-from typing import Annotated, NamedTuple
+from typing import Annotated
 
 from fastapi import Header
-from playwright.async_api import BrowserContext, Page
 from pydantic import BaseModel, Field
 
-from src.browser import BrowserFactory
+from src.browser import BrowserDepClass, BrowserFactory
 from src.consts import (
     LOG_LEVEL,
     PROXY_PASSWORD,
@@ -45,11 +44,6 @@ MIN_WAIT_MS = 1.0
 def remaining_ms(timer: TimeoutTimer) -> float:
     """Milliseconds left, never 0 - Playwright reads that as no timeout at all."""
     return max(MIN_WAIT_MS, timer.remaining() * 1000)
-
-
-class BrowserDepClass(NamedTuple):
-    page: Page
-    context: BrowserContext
 
 
 async def get_browser(
