@@ -1,20 +1,20 @@
 import logging
 import time
 from collections.abc import AsyncGenerator
-from typing import Annotated, NamedTuple, cast
+from typing import Annotated, NamedTuple
 
 from fastapi import Header
-from invisible_playwright.async_api import InvisiblePlaywright
-from playwright.async_api import Browser, BrowserContext, Page
+from playwright.async_api import BrowserContext, Page
 from pydantic import BaseModel, Field
 
+from src.browser import BrowserFactory
 from src.consts import (
-    BROWSER_LOCALE,
     LOG_LEVEL,
     PROXY_PASSWORD,
     PROXY_SERVER,
     PROXY_USERNAME,
 )
+from src.proxy import resolve_proxy_settings
 
 solver_logger = logging.getLogger("playwright_captcha")
 solver_logger.handlers.clear()
@@ -73,39 +73,17 @@ async def get_browser(
         ),
     ] = None,
 ) -> AsyncGenerator[BrowserDepClass]:
-    """Get InvisiblePlaywright browser instance."""
-    header_server = x_proxy_server
-    header_username = x_proxy_username
-    header_password = x_proxy_password
-
-    proxy_config = None
-
-    if header_server:
-        proxy_config = {
-            "server": header_server,
-            "username": header_username,
-            "password": header_password,
-        }
-    elif PROXY_SERVER:
-        proxy_config = {
-            "server": PROXY_SERVER,
-            "username": PROXY_USERNAME,
-            "password": PROXY_PASSWORD,
-        }
-
-    async with InvisiblePlaywright(
-        headless=True,
-        proxy=proxy_config,
-        humanize=True,
-        locale=BROWSER_LOCALE or "auto",
-        extra_prefs={
-            "devtools.jsonview.enabled": False,
-            "browser.tabs.remote.useCrossOriginOpenerPolicy": False,
-            "browser.tabs.remote.useCrossOriginEmbedderPolicy": False,
-        },
-    ) as browser_raw:
-        # InvisiblePlaywright yields a Browser instance
-        browser = cast("Browser", browser_raw)
-        context = await browser.new_context()
-        page = await context.new_page()
-        yield BrowserDepClass(page, context)
+    """Open and dispose a browser resource for one request."""
+    proxy = resolve_proxy_settings(
+        header_server=x_proxy_server,
+        header_username=x_proxy_username,
+        header_password=x_proxy_password,
+        environment_server=PROXY_SERVER,
+        environment_username=PROXY_USERNAME,
+        environment_password=PROXY_PASSWORD,
+    )
+    resource = await BrowserFactory().open(proxy)
+    try:
+        yield BrowserDepClass(resource.page, resource.context)
+    finally:
+        await resource.close()
