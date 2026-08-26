@@ -1,6 +1,6 @@
 services:
   byparr:
-    image: ghcr.io/thephaseless/byparr:latest
+    image: ghcr.io/technobecet/byparr:latest
     restart: unless-stopped
     # environment:
     #   LOG_LEVEL: debug
