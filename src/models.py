@@ -11,6 +11,7 @@ from pydantic.alias_generators import to_camel
 from src import consts
 
 MS_PER_SECOND = 1000
+SESSION_PRINTABLE_MESSAGE = "session must contain printable characters only"
 
 
 class LinkRequest(BaseModel):
@@ -40,6 +41,24 @@ class LinkRequest(BaseModel):
         alias="returnOnlyCookies",
         description="Return only cookies, skip the page HTML content in the response.",
     )
+    session: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Optional FlareSolverr-compatible session name.",
+    )
+
+    @field_validator("session", mode="before")
+    @classmethod
+    def normalize_session(cls, value: str | None) -> str | None:
+        """Normalize session names while keeping them safe for identifiers and logs."""
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if not normalized.isprintable():
+            raise ValueError(SESSION_PRINTABLE_MESSAGE)
+        return normalized
 
     @field_validator("max_timeout")
     @classmethod
