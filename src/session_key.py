@@ -53,8 +53,8 @@ def build_session_key(
 
 def _session_site(hostname: str) -> str:
     """Return the registrable domain, or a normalized IP address for IP hosts."""
-    candidate = hostname.rstrip(".")
-    if not candidate:
+    candidate = hostname.removesuffix(".")
+    if not candidate or candidate.endswith("."):
         raise ValueError(INVALID_SESSION_URL_MESSAGE)
     try:
         return str(ipaddress.ip_address(candidate))

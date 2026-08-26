@@ -54,6 +54,21 @@ def test_session_key_uses_the_registrable_domain() -> None:
     assert left.site == "example.co.uk"
 
 
+def test_session_key_accepts_one_trailing_dns_root_dot() -> None:
+    proxy = ProxySettings.direct()
+
+    dotted = build_session_key("account-a", "https://reader.example.com.", proxy)
+    plain = build_session_key("account-a", "https://reader.example.com", proxy)
+
+    assert dotted == plain
+
+
+@pytest.mark.parametrize("url", ["https://example.com..", "https://example.com..."])
+def test_session_key_rejects_multiple_trailing_dns_root_dots(url: str) -> None:
+    with pytest.raises(ValueError, match=r"absolute HTTP\(S\) URL"):
+        build_session_key("account-a", url, ProxySettings.direct())
+
+
 def test_session_key_isolated_by_site() -> None:
     proxy = ProxySettings.direct()
 
