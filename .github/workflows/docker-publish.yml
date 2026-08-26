@@ -75,7 +75,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/TechnoBeceT/Byparr
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.licenses=GPL-3.0-or-later
+            org.opencontainers.image.licenses=GPL-3.0-only
             org.opencontainers.image.title=Byparr
             org.opencontainers.image.description=Modified TechnoBeceT fork of Byparr
 

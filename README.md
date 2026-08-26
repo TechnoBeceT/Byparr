@@ -40,13 +40,14 @@ Recently I've partnered with a _new in town_ proxy service - ProxyBase - to offe
 ## Tags
 
 - `v*`/`latest` - Releases published by this fork from version tags
-- `sha-...` - Immutable image reference produced by a manual publish
+- `sha-...` - Revision-derived mutable tag; use an image digest for an immutable reference
 
 The fork's images are published as `ghcr.io/technobecet/byparr`. The image
 contains this repository's GPLv3 `LICENSE`; its OCI source label links to the
 [corresponding fork source](https://github.com/TechnoBeceT/Byparr). Pull
-requests and ordinary branch pushes build and test only; they never publish an
-image.
+requests and `v*` tag pushes build and test; manual dispatch builds, tests,
+and publishes. Ordinary branch pushes do not trigger this workflow, and neither
+branch pushes nor pull requests publish an image.
 
 ## Usage
 
@@ -75,7 +76,7 @@ docker compose up -d
 ### Local install
 
 1. Install ([or update when Python version changes](https://github.com/astral-sh/uv/issues/17887)) [uv](https://docs.astral.sh/uv/getting-started/installation/).
-2. Clone this repo - `git clone https://github.com/ThePhaseless/Byparr`
+2. Clone this fork - `git clone https://github.com/TechnoBeceT/Byparr`
 3. Run `uv run main.py`
 4. Enjoy!
 
