@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import gc
 import logging
 from contextlib import asynccontextmanager
 from http import HTTPStatus
@@ -30,7 +31,7 @@ from src.endpoints import read_item
 from src.models import LinkRequest
 from src.proxy import ProxySettings
 from src.sessions import SessionCapacityError, SessionManager
-from src.utils import BrowserDepClass, TimeoutTimer, remaining_ms
+from src.utils import BrowserDepClass, TimeoutTimer, get_request_browser, remaining_ms
 
 client = TestClient(app)
 
@@ -319,6 +320,42 @@ class PartialRouteEndpointFactory(EndpointFactory):
         return resource
 
 
+class CancelFailRouteEndpointFactory(EndpointFactory):
+    """Fail a route protocol update after its local state transition."""
+
+    def __init__(self, failure_phase: str, error: PlaywrightError) -> None:
+        super().__init__()
+        self.failure_phase = failure_phase
+        self.error = error
+        self.unrelated_handler = object()
+        self.handlers: list[object] = [self.unrelated_handler]
+        self.operation_started = asyncio.Event()
+        self.allow_failure = asyncio.Event()
+
+    async def open(self, proxy: ProxySettings) -> EndpointResource:
+        resource = await super().open(proxy)
+        if len(self.resources) != 1:
+            return resource
+
+        async def install(_pattern: str, handler: object) -> None:
+            self.handlers.append(handler)
+            if self.failure_phase == "registration":
+                self.operation_started.set()
+                await self.allow_failure.wait()
+                raise self.error
+
+        async def remove(_pattern: str, handler: object) -> None:
+            self.handlers.remove(handler)
+            if self.failure_phase == "cleanup":
+                self.operation_started.set()
+                await self.allow_failure.wait()
+                raise self.error
+
+        resource.page.route.side_effect = install
+        resource.page.unroute.side_effect = remove
+        return resource
+
+
 class ChallengeProbeEndpointFactory(EndpointFactory):
     """Drive one retained request through a selected challenge-probe failure."""
 
@@ -588,17 +625,38 @@ async def test_fatal_pdf_body_failure_retires_retained_resource_without_logging_
         assert secret not in rendered
 
 
+@pytest.mark.parametrize(
+    ("full_url", "expected_site", "site_secrets"),
+    [
+        (
+            (
+                "https://target-user:target-password@reader.example.com"
+                "/private/document.pdf?token=query-secret"
+            ),
+            "example.com",
+            (),
+        ),
+        (
+            (
+                "https://target-user:target-password@"
+                "[fe80:0:0::1%25pdf-scope-secret]/private/document.pdf"
+                "?token=query-secret"
+            ),
+            "fe80::1",
+            ("pdf-scope-secret",),
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_ordinary_pdf_failure_falls_back_with_secret_safe_log(
     monkeypatch: pytest.MonkeyPatch,
+    full_url: str,
+    expected_site: str,
+    site_secrets: tuple[str, ...],
 ) -> None:
     """A recoverable PDF fetch error keeps HTML fallback without logging raw data."""
     from src.utils import logger as production_logger
 
-    full_url = (
-        "https://target-user:target-password@reader.example.com/private/document.pdf"
-        "?token=query-secret"
-    )
     leaked_values = (
         full_url,
         "/private/document.pdf",
@@ -607,6 +665,7 @@ async def test_ordinary_pdf_failure_falls_back_with_secret_safe_log(
         "query-secret",
         "cookie-secret",
         "header-secret",
+        *site_secrets,
     )
     dep = fake_dep()
     page = cast("AsyncMock", dep.page)
@@ -628,7 +687,7 @@ async def test_ordinary_pdf_failure_falls_back_with_secret_safe_log(
         "<html><title>Login</title></html>",
     )
     rendered = stream.getvalue()
-    assert "pdf_fetch_fallback site=example.com error_type=Error" in rendered
+    assert f"pdf_fetch_fallback site={expected_site} error_type=Error" in rendered
     for secret in leaked_values:
         assert secret not in rendered
 
@@ -815,6 +874,87 @@ async def test_block_media_cleanup_cancellation_drains_exact_handler_removal() -
 
     assert handlers == [unrelated]
     page.unroute.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("failure_phase", "expected_resources"),
+    [("registration", 1), ("cleanup", 2)],
+)
+@pytest.mark.asyncio
+async def test_route_failure_after_cancellation_preserves_cancellation_without_loop_leak(
+    failure_phase: str,
+    expected_resources: int,
+) -> None:
+    """A secondary route failure is consumed while caller cancellation wins."""
+    leaked_values = (
+        (
+            "https://route-user:route-password@example.test/private"
+            "?token=route-query-secret"
+        ),
+        "route-user",
+        "route-password",
+        "route-query-secret",
+        "route-cookie-secret",
+        "route-header-secret",
+    )
+    factory = CancelFailRouteEndpointFactory(
+        failure_phase,
+        PlaywrightError(" | ".join(leaked_values)),
+    )
+    manager = SessionManager(factory)
+    request = LinkRequest(
+        url="https://example.test/one",
+        session="account",
+        blockMedia=True,
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(dict(context)))
+
+    async def run_request(target: LinkRequest) -> None:
+        async with get_request_browser(target, manager) as dep:
+            await read_item(target, dep)
+
+    try:
+        reading = asyncio.create_task(run_request(request))
+        await factory.operation_started.wait()
+        reading.cancel()
+        factory.allow_failure.set()
+        result = await asyncio.gather(reading, return_exceptions=True)
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+
+        await run_request(
+            LinkRequest(
+                url="https://example.test/two",
+                session="account",
+                blockMedia=False,
+            )
+        )
+    finally:
+        await manager.close()
+        loop.set_exception_handler(previous_handler)
+
+    assert {
+        "result_cancelled": isinstance(result[0], asyncio.CancelledError),
+        "task_cancelled": reading.cancelled(),
+        "foreign_handler_only": factory.handlers == [factory.unrelated_handler],
+        "loop_error_count": len(loop_errors),
+    } == {
+        "result_cancelled": True,
+        "task_cancelled": True,
+        "foreign_handler_only": True,
+        "loop_error_count": 0,
+    }
+    assert len(factory.resources) == expected_resources
+    assert [resource.close.await_count for resource in factory.resources] == [
+        1
+    ] * expected_resources
+    rendered_loop_errors = " ".join(str(context) for context in loop_errors)
+    for secret in leaked_values:
+        assert secret not in rendered_loop_errors
 
 
 @pytest.mark.asyncio

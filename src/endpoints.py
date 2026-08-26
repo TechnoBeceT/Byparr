@@ -187,18 +187,24 @@ async def setup_routes(
         else:
             await route.continue_()
 
-    try:
-        registration_cancelled = await _complete_route_operation(
-            dep.page.route("**/*", block_media_route)
-        )
-    except BaseException as error:
-        cleanup_cancelled = await _remove_owned_route(dep.page, block_media_route)
-        if cleanup_cancelled:
-            raise asyncio.CancelledError from error
-        raise
-    if registration_cancelled:
-        await _remove_owned_route(dep.page, block_media_route)
-        raise asyncio.CancelledError
+    registration_cancelled, registration_error = await _complete_route_operation(
+        dep.page.route("**/*", block_media_route)
+    )
+    if registration_error is not None or registration_cancelled:
+        try:
+            cleanup_cancelled = await _remove_owned_route(dep.page, block_media_route)
+        except BrowserResourceUnusableError as cleanup_error:
+            if registration_cancelled:
+                raise asyncio.CancelledError from cleanup_error
+            raise
+        if registration_cancelled or cleanup_cancelled:
+            if registration_error is not None and is_fatal_browser_error(
+                registration_error
+            ):
+                raise asyncio.CancelledError from BrowserResourceUnusableError()
+            raise asyncio.CancelledError from None
+        assert registration_error is not None
+        raise registration_error
     try:
         yield
     finally:
@@ -211,28 +217,32 @@ async def _remove_owned_route(
     page: Page, handler: Callable[[Route], Awaitable[None]]
 ) -> bool:
     """Remove the exact request handler or mark the browser state unusable."""
-    try:
-        return await _complete_route_operation(page.unroute("**/*", handler))
-    except BaseException as error:
-        raise BrowserResourceUnusableError from error
+    cancellation_seen, operation_error = await _complete_route_operation(
+        page.unroute("**/*", handler)
+    )
+    if operation_error is not None:
+        if cancellation_seen:
+            raise asyncio.CancelledError from BrowserResourceUnusableError()
+        raise BrowserResourceUnusableError from None
+    return cancellation_seen
 
 
-async def _complete_route_operation(operation: Awaitable[object]) -> bool:
-    """Drain one owned route operation and report delayed caller cancellation."""
+async def _complete_route_operation(
+    operation: Awaitable[object],
+) -> tuple[bool, BaseException | None]:
+    """Drain one owned operation, consuming its result after caller cancellation."""
     task = asyncio.ensure_future(operation)
     cancellation_seen = False
-    while True:
+    while not task.done():
         try:
-            await asyncio.shield(task)
+            await asyncio.wait((task,))
         except asyncio.CancelledError:
-            if task.cancelled():
-                raise
             cancellation_seen = True
-            if task.done():
-                task.result()
-                return True
-        else:
-            return cancellation_seen
+    try:
+        task.result()
+    except BaseException as error:
+        return cancellation_seen, error
+    return cancellation_seen, None
 
 
 async def _navigate_and_solve(

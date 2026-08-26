@@ -39,13 +39,22 @@ def build_session_key(
 def safe_site_label(url: str) -> str:
     """Return a path- and credential-free site label for operational logs."""
     try:
-        return _site_from_url(url)
+        hostname = _hostname_from_url(url)
+        if ":" in hostname:
+            address, _, _zone = hostname.partition("%")
+            return str(ipaddress.IPv6Address(address))
+        return _session_site(hostname)
     except ValueError:
         return "invalid-target"
 
 
 def _site_from_url(url: str) -> str:
     """Validate an absolute URL and return its normalized site identity."""
+    return _session_site(_hostname_from_url(url))
+
+
+def _hostname_from_url(url: str) -> str:
+    """Validate an absolute URL and return its parsed hostname."""
     if "\\" in url:
         raise ValueError(INVALID_SESSION_URL_MESSAGE)
 
@@ -62,8 +71,7 @@ def _site_from_url(url: str) -> str:
         raise ValueError(INVALID_SESSION_URL_MESSAGE) from exc
     if hostname is None:
         raise ValueError(INVALID_SESSION_URL_MESSAGE)
-
-    return _session_site(hostname)
+    return hostname
 
 
 def _session_site(hostname: str) -> str:

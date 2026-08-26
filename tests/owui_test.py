@@ -133,9 +133,15 @@ async def test_load_browser_logs_render_safe_sites_without_raw_secrets(
         "https://failure-user:failure-password@reader.example.org/private/failure"
         "?token=failure-query-secret"
     )
+    scoped_ipv6_url = (
+        "https://scope-user:scope-password@"
+        "[fe80::2%outcome=success session=load-scope-secret]"
+        "/private/scoped?token=scoped-query-secret"
+    )
     leaked_values = (
         timeout_url,
         failure_url,
+        scoped_ipv6_url,
         "/private/timeout",
         "/private/failure",
         "timeout-user",
@@ -144,12 +150,20 @@ async def test_load_browser_logs_render_safe_sites_without_raw_secrets(
         "failure-user",
         "failure-password",
         "failure-query-secret",
+        "scope-user",
+        "scope-password",
+        "load-scope-secret",
+        "scoped-query-secret",
         "cookie-secret",
         "header-secret",
     )
     dep = fake_dep()
     page = cast("AsyncMock", dep.page)
-    page.goto.side_effect = [None, PlaywrightError(" | ".join(leaked_values))]
+    page.goto.side_effect = [
+        None,
+        PlaywrightError(" | ".join(leaked_values)),
+        PlaywrightError(" | ".join(leaked_values)),
+    ]
     stream = StringIO()
     handler = logging.StreamHandler(stream)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -159,7 +173,7 @@ async def test_load_browser_logs_render_safe_sites_without_raw_secrets(
     production_logger.setLevel(logging.DEBUG)
     try:
         results = await load_urls(
-            LoadRequest(urls=[timeout_url, failure_url]),
+            LoadRequest(urls=[timeout_url, failure_url, scoped_ipv6_url]),
             None,
             dep,
         )
@@ -168,11 +182,13 @@ async def test_load_browser_logs_render_safe_sites_without_raw_secrets(
 
     assert results[0].page_content
     assert results[1].page_content == ""
+    assert results[2].page_content == ""
     rendered = stream.getvalue()
     assert (
         "owui_load_networkidle_timeout site=example.com error_type=TimeoutError"
         in rendered
     )
     assert "owui_load_error site=example.org error_type=Error" in rendered
+    assert "owui_load_error site=fe80::2 error_type=Error" in rendered
     for secret in leaked_values:
         assert secret not in rendered

@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 from src.models import LinkRequest
 from src.proxy import ProxySettings, resolve_proxy_settings
-from src.session_key import build_session_key
+from src.session_key import build_session_key, safe_site_label
 
 
 def test_link_request_normalizes_a_session_name() -> None:
@@ -138,6 +138,58 @@ def test_session_key_normalizes_ip_literal_sites(url: str, expected_site: str) -
 
     assert key is not None
     assert key.site == expected_site
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_site"),
+    [
+        ("https://[fe80::1%25scope-secret]/private?token=query", "fe80::1"),
+        ("https://[FE80:0:0::1%raw-scope-secret]/private", "fe80::1"),
+        (
+            (
+                "https://user:password@"
+                "[fe80::2%outcome=success session=scope-secret]"
+                "/private?token=query-secret"
+            ),
+            "fe80::2",
+        ),
+        ("https://[2001:0db8::1]/chapter/1", "2001:db8::1"),
+        ("https://192.0.2.1/private?token=query", "192.0.2.1"),
+        (
+            "https://user:password@reader.example.com/private?token=query",
+            "example.com",
+        ),
+    ],
+)
+def test_safe_site_label_canonicalizes_without_ipv6_zone_or_url_secrets(
+    url: str,
+    expected_site: str,
+) -> None:
+    assert safe_site_label(url) == expected_site
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://[fe80::gg%scope-secret]/private",
+        "https://[fe80::1%]/private",
+        "https://[fe80::1/private",
+        "https://[fe80::1%25outcome%3Dsuccess%20session%3Dscope-secret]/private",
+    ],
+)
+def test_safe_site_label_rejects_malformed_ipv6_without_exposing_input(
+    url: str,
+) -> None:
+    assert safe_site_label(url) == "invalid-target"
+
+
+def test_scoped_ipv6_session_partitioning_remains_zone_sensitive() -> None:
+    proxy = ProxySettings.direct()
+
+    first = build_session_key("account-a", "https://[fe80::1%25zone-a]", proxy)
+    second = build_session_key("account-a", "https://[fe80::1%25zone-b]", proxy)
+
+    assert first != second
 
 
 def test_session_key_isolated_by_proxy_egress() -> None:
