@@ -115,6 +115,30 @@ class TrackedFactory:
         return resource
 
 
+class CapacityFactory:
+    def __init__(self, blocked_resources: int) -> None:
+        self.tracker = LiveResourceTracker()
+        self.calls: list[ProxySettings] = []
+        self.allow_close = asyncio.Event()
+        self.close_started = [asyncio.Event() for _ in range(blocked_resources)]
+        self.resources: list[FakeResource] = []
+
+    async def open(self, proxy: ProxySettings) -> FakeResource:
+        self.calls.append(proxy)
+        self.tracker.opened()
+        index = len(self.resources)
+        resource = FakeResource(
+            str(index + 1),
+            close_started=(
+                self.close_started[index] if index < len(self.close_started) else None
+            ),
+            allow_close=(self.allow_close if index < len(self.close_started) else None),
+            tracker=self.tracker,
+        )
+        self.resources.append(resource)
+        return resource
+
+
 class CancellingOpenFactory:
     def __init__(self) -> None:
         self.calls: list[ProxySettings] = []
@@ -164,6 +188,17 @@ async def next_turn() -> None:
     reached = asyncio.Event()
     asyncio.get_running_loop().call_soon(reached.set)
     await reached.wait()
+
+
+def pending_coroutines(name: str) -> list[asyncio.Task]:
+    current = asyncio.current_task()
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if task is not current
+        and not task.done()
+        and name in getattr(task.get_coro(), "__qualname__", "")
+    ]
 
 
 def key(session: str, site: str, proxy: ProxySettings | None = None) -> SessionKey:
@@ -414,6 +449,122 @@ async def test_capacity_fails_fast_when_every_entry_is_busy() -> None:
 
     assert len(factory.calls) == 1
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_same_key_capacity_replacement_is_shared_at_limit_one() -> None:
+    factory = CapacityFactory(blocked_resources=1)
+    manager = SessionManager(factory, max_sessions=1)
+    destination = key("new", "new.example")
+
+    async with manager.acquire(key("old", "old.example"), ProxySettings.direct()):
+        pass
+
+    async def lease_destination() -> None:
+        async with manager.acquire(destination, ProxySettings.direct()):
+            pass
+
+    first = asyncio.create_task(lease_destination())
+    await factory.close_started[0].wait()
+    second = asyncio.create_task(lease_destination())
+    await next_turn()
+
+    factory.allow_close.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert results == [None, None]
+    assert len(factory.calls) == 2
+    assert factory.tracker.maximum == 1
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_same_key_capacity_replacement_preserves_second_idle_entry() -> None:
+    factory = CapacityFactory(blocked_resources=2)
+    manager = SessionManager(factory, max_sessions=2)
+    destination = key("new", "new.example")
+
+    async with manager.acquire(key("old-a", "a.example"), ProxySettings.direct()):
+        pass
+    async with manager.acquire(key("old-b", "b.example"), ProxySettings.direct()):
+        pass
+
+    async def lease_destination() -> None:
+        async with manager.acquire(destination, ProxySettings.direct()):
+            pass
+
+    first = asyncio.create_task(lease_destination())
+    await factory.close_started[0].wait()
+    second = asyncio.create_task(lease_destination())
+    await next_turn()
+    second_idle_was_evicted = factory.close_started[1].is_set()
+
+    factory.allow_close.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert results == [None, None]
+    assert not second_idle_was_evicted
+    assert sum(resource.close_calls for resource in factory.resources[:2]) == 1
+    assert len(factory.calls) == 3
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_capacity_replacer_does_not_cancel_shared_admission() -> None:
+    factory = CapacityFactory(blocked_resources=1)
+    manager = SessionManager(factory, max_sessions=1)
+    destination = key("new", "new.example")
+
+    async with manager.acquire(key("old", "old.example"), ProxySettings.direct()):
+        pass
+
+    async def lease_destination() -> None:
+        async with manager.acquire(destination, ProxySettings.direct()):
+            pass
+
+    cancelled = asyncio.create_task(lease_destination())
+    await factory.close_started[0].wait()
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+
+    survivor = asyncio.create_task(lease_destination())
+    await next_turn()
+    assert len(factory.calls) == 1
+
+    factory.allow_close.set()
+    await survivor
+
+    assert len(factory.calls) == 2
+    assert factory.tracker.maximum == 1
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_and_suppresses_pending_admission() -> None:
+    factory = CapacityFactory(blocked_resources=1)
+    manager = SessionManager(factory, max_sessions=1)
+
+    async with manager.acquire(key("old", "old.example"), ProxySettings.direct()):
+        pass
+
+    async def lease_destination() -> None:
+        async with manager.acquire(key("new", "new.example"), ProxySettings.direct()):
+            pass
+
+    acquiring = asyncio.create_task(lease_destination())
+    await factory.close_started[0].wait()
+    closing = asyncio.create_task(manager.close())
+    await next_turn()
+    assert not closing.done()
+
+    factory.allow_close.set()
+    results = await asyncio.gather(acquiring, closing, return_exceptions=True)
+
+    assert isinstance(results[0], RuntimeError)
+    assert results[1] is None
+    assert len(factory.calls) == 1
+    assert factory.tracker.live == 0
 
 
 @pytest.mark.asyncio
@@ -758,6 +909,107 @@ async def test_cleanup_timeout_returns_stable_error_while_retirement_continues(
     allow_close.set()
     await replacement
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_barrier_timeout_and_cancellation_do_not_accumulate_event_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    resource = FakeResource(
+        "blocked", close_started=close_started, allow_close=allow_close
+    )
+    manager = SessionManager(FakeFactory([resource]))
+    session_key = key("account-a", "example.com")
+
+    async with manager.acquire(session_key, ProxySettings.direct()):
+        assert await manager.invalidate(session_key)
+    await close_started.wait()
+    baseline = len(pending_coroutines("Event.wait"))
+
+    async def wait_for_replacement() -> None:
+        async with manager.acquire(session_key, ProxySettings.direct()):
+            pass
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sessions, "_lifecycle_timeout", immediate_timeout)
+        for _ in range(2):
+            with pytest.raises(sessions.SessionLifecycleTimeoutError):
+                await wait_for_replacement()
+
+    for _ in range(2):
+        waiter = asyncio.create_task(wait_for_replacement())
+        await next_turn()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+    await next_turn()
+    pending_after_waits = len(pending_coroutines("Event.wait"))
+    allow_close.set()
+    await manager.close()
+
+    assert pending_after_waits == baseline
+    assert resource.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_timeouts_do_not_accumulate_aggregate_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    resource = FakeResource(
+        "blocked", close_started=close_started, allow_close=allow_close
+    )
+    manager = SessionManager(FakeFactory([resource]))
+
+    async with manager.acquire(key("account-a", "example.com"), ProxySettings.direct()):
+        pass
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sessions, "_lifecycle_timeout", immediate_timeout)
+        for _ in range(2):
+            with pytest.raises(sessions.SessionLifecycleTimeoutError):
+                await manager.reset("account-a")
+
+    await close_started.wait()
+    await next_turn()
+    pending_waiters = pending_coroutines("SessionManager._finish_shutdown")
+    allow_close.set()
+    await manager.close()
+
+    assert pending_waiters == []
+    assert resource.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_expiry_cleans_aggregate_waiter() -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    resource = FakeResource(
+        "blocked", close_started=close_started, allow_close=allow_close
+    )
+    clock = FakeClock()
+    manager = SessionManager(FakeFactory([resource]), ttl_seconds=1, clock=clock)
+
+    async with manager.acquire(key("account-a", "example.com"), ProxySettings.direct()):
+        pass
+    clock.value = 1
+    expiring = asyncio.create_task(manager.expire_idle())
+    await close_started.wait()
+    expiring.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await expiring
+
+    await next_turn()
+    pending_waiters = pending_coroutines("SessionManager._finish_shutdown")
+    allow_close.set()
+    await manager.close()
+
+    assert pending_waiters == []
+    assert resource.close_calls == 1
 
 
 @pytest.mark.asyncio

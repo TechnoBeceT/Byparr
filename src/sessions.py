@@ -6,10 +6,11 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from src._session_log import log_session_event
 from src._session_state import (
+    AdmissionReservation,
     ClaimDecision,
     OpenResult,
     SessionCapacityError,
@@ -59,6 +60,7 @@ class SessionManager:
         self._entries: dict[SessionKey, SessionEntry] = {}
         self._owned: dict[int, SessionEntry] = {}
         self._barriers: dict[SessionKey, SessionEntry] = {}
+        self._admissions: dict[SessionKey, AdmissionReservation] = {}
         self._map_lock = asyncio.Lock()
         self._touch_order = 0
         self._closed = False
@@ -176,12 +178,13 @@ class SessionManager:
             if decision.barrier is not None:
                 await self._wait_for_event(decision.barrier.retired, key, "replacement")
                 continue
-            eviction = decision.eviction
-            assert eviction is not None
-            log_session_event(logging.DEBUG, "evict", eviction.key)
-            retirement_task = eviction.retirement_task
-            assert retirement_task is not None
-            error = await self._wait_for_task(retirement_task, eviction.key, "evict")
+            reservation = decision.reservation
+            assert reservation is not None
+            if decision.eviction is not None:
+                log_session_event(logging.DEBUG, "evict", decision.eviction.key)
+            reservation_task = reservation.task
+            assert reservation_task is not None
+            error = await self._wait_for_task(reservation_task, key, "evict")
             if error is not None:
                 raise error
 
@@ -194,31 +197,63 @@ class SessionManager:
         barrier = self._barriers.get(key)
         if barrier is not None:
             return ClaimDecision(barrier=barrier)
+        reservation = self._admissions.get(key)
+        if reservation is not None:
+            return ClaimDecision(reservation=reservation)
         existing = self._entries.get(key)
         if existing is not None:
             if existing.claims == 0:
                 existing.drained.clear()
             existing.claims += 1
             return ClaimDecision(result=existing, event="reuse")
-        if len(self._owned) >= self._max_sessions:
+        if self._capacity_count_locked() >= self._max_sessions:
             eviction = self._lru_idle_entry_locked()
             if eviction is None:
                 return ClaimDecision(capacity_rejected=True)
             self._schedule_retirement_locked(eviction)
-            return ClaimDecision(eviction=eviction)
+            reservation = AdmissionReservation(key=key, victim=eviction)
+            self._admissions[key] = reservation
+            reservation.task = asyncio.create_task(
+                self._finish_admission(reservation, proxy)
+            )
+            return ClaimDecision(reservation=reservation, eviction=eviction)
         return ClaimDecision(result=self._new_entry_locked(key, proxy), event="create")
 
-    def _new_entry_locked(self, key: SessionKey, proxy: ProxySettings) -> SessionEntry:
+    def _new_entry_locked(
+        self, key: SessionKey, proxy: ProxySettings, *, claims: int = 1
+    ) -> SessionEntry:
         """Create an admitted entry and register ownership before opening."""
         entry = SessionEntry(
             key=key,
             last_used=self._clock(),
             touch_order=self._next_touch_order(),
+            claims=claims,
         )
+        if claims == 0:
+            entry.drained.set()
         self._entries[key] = entry
         self._owned[id(entry)] = entry
         entry.creation_task = asyncio.create_task(self._open_entry(entry, proxy))
         return entry
+
+    async def _finish_admission(
+        self, reservation: AdmissionReservation, proxy: ProxySettings
+    ) -> BaseException | None:
+        """Replace one retired slot exactly once for all same-key callers."""
+        retirement_task = reservation.victim.retirement_task
+        assert retirement_task is not None
+        error = await asyncio.shield(retirement_task)
+        created = False
+        async with self._map_lock:
+            if self._admissions.get(reservation.key) is not reservation:
+                return error
+            self._admissions.pop(reservation.key)
+            if error is None and not self._closed:
+                self._new_entry_locked(reservation.key, proxy, claims=0)
+                created = True
+        if created:
+            log_session_event(logging.DEBUG, "create", reservation.key)
+        return error
 
     async def _open_entry(
         self, entry: SessionEntry, proxy: ProxySettings
@@ -271,6 +306,14 @@ class SessionManager:
         if not candidates:
             return None
         return min(candidates, key=lambda entry: (entry.last_used, entry.touch_order))
+
+    def _capacity_count_locked(self) -> int:
+        """Count live resources plus replacement slots whose victims are terminal."""
+        released_reservations = sum(
+            id(reservation.victim) not in self._owned
+            for reservation in self._admissions.values()
+        )
+        return len(self._owned) + released_reservations
 
     def _schedule_retirement_locked(
         self, entry: SessionEntry
@@ -344,6 +387,11 @@ class SessionManager:
             self._closed = True
             entries = list(self._owned.values())
             tasks = [self._schedule_retirement_locked(entry) for entry in entries]
+            tasks.extend(
+                reservation.task
+                for reservation in self._admissions.values()
+                if reservation.task is not None
+            )
             self._shutdown_task = asyncio.create_task(self._finish_shutdown(tasks))
             return self._shutdown_task, entries, True
 
@@ -368,7 +416,10 @@ class SessionManager:
             return None
         waiter = asyncio.create_task(self._finish_shutdown(tasks))
         key = entries[0].key if entries else None
-        return await self._wait_for_task(waiter, key, reason)
+        try:
+            return await self._wait_for_task(waiter, key, reason)
+        finally:
+            await self._cancel_ephemeral_task(waiter)
 
     async def _wait_for_task(
         self,
@@ -398,6 +449,16 @@ class SessionManager:
             error = SessionLifecycleTimeoutError()
             log_session_event(logging.WARNING, "timeout", key, error, reason=reason)
             raise error from timeout
+        finally:
+            await self._cancel_ephemeral_task(waiter)
+
+    @staticmethod
+    async def _cancel_ephemeral_task(task: asyncio.Task) -> None:
+        """Cancel and consume a helper without touching shielded owned work."""
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
     @staticmethod
     def _log_entries(event: str, entries: list[SessionEntry]) -> None:

@@ -61,10 +61,20 @@ class SessionEntry:
 
 
 @dataclass
+class AdmissionReservation:
+    """A manager-owned replacement slot shared by callers for one key."""
+
+    key: SessionKey
+    victim: SessionEntry
+    task: asyncio.Task[BaseException | None] | None = None
+
+
+@dataclass
 class ClaimDecision:
     """One atomic admission decision emitted after the map lock is released."""
 
     barrier: SessionEntry | None = None
+    reservation: AdmissionReservation | None = None
     eviction: SessionEntry | None = None
     result: SessionEntry | None = None
     event: str | None = None
