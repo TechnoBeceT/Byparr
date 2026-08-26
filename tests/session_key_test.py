@@ -38,7 +38,7 @@ def test_link_request_rejects_sessions_longer_than_128_characters() -> None:
 @pytest.mark.parametrize("session", [1, [], {}])
 def test_link_request_rejects_non_string_session_values(session: object) -> None:
     with pytest.raises(ValidationError):
-        LinkRequest(url="https://example.com", session=session)
+        LinkRequest.model_validate({"url": "https://example.com", "session": session})
 
 
 def test_session_key_uses_the_registrable_domain() -> None:

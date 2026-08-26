@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager, suppress
+from typing import cast
+
+from playwright.async_api import BrowserContext, Page
 
 from src._session_log import log_session_event
 from src._session_state import (
@@ -16,9 +19,15 @@ from src._session_state import (
     SessionCapacityError,
     SessionEntry,
     SessionLifecycleTimeoutError,
+    SessionPoolSnapshot,
     SessionProxyMismatchError,
+    SessionResetError,
 )
-from src.browser import BrowserDepClass, BrowserFactory
+from src.browser import (
+    BrowserDepClass,
+    BrowserFactoryProtocol,
+    ManagedBrowserResource,
+)
 from src.consts import (
     SESSION_LIFECYCLE_TIMEOUT_SECONDS,
     SESSION_MAX_SESSIONS,
@@ -39,7 +48,7 @@ class SessionManager:
 
     def __init__(
         self,
-        factory: BrowserFactory,
+        factory: BrowserFactoryProtocol,
         ttl_seconds: int = SESSION_TTL_SECONDS,
         max_sessions: int = SESSION_MAX_SESSIONS,
         clock: Callable[[], float] = time.monotonic,
@@ -61,6 +70,7 @@ class SessionManager:
         self._owned: dict[int, SessionEntry] = {}
         self._barriers: dict[SessionKey, SessionEntry] = {}
         self._admissions: dict[SessionKey, AdmissionReservation] = {}
+        self._session_generations: dict[str, int] = {}
         self._map_lock = asyncio.Lock()
         self._touch_order = 0
         self._closed = False
@@ -69,12 +79,14 @@ class SessionManager:
     @asynccontextmanager
     async def acquire(
         self, key: SessionKey, proxy: ProxySettings
-    ) -> AsyncIterator[BrowserDepClass]:
+    ) -> AsyncGenerator[BrowserDepClass]:
         """Lease the retained browser for one key, creating it only once."""
         if key.proxy_id != proxy.identity:
             raise SessionProxyMismatchError
+        async with self._map_lock:
+            generation = self._session_generations.get(key.session, 0)
         while True:
-            entry = await self._claim_entry(key, proxy)
+            entry = await self._claim_entry(key, proxy, generation)
             lease_acquired = False
             used = False
             retry = False
@@ -100,7 +112,10 @@ class SessionManager:
                     retry = True
                 else:
                     used = True
-                    yield BrowserDepClass(resource.page, resource.context)
+                    yield BrowserDepClass(
+                        cast("Page", resource.page),
+                        cast("BrowserContext", resource.context),
+                    )
                     return
             finally:
                 cleanup = asyncio.create_task(
@@ -114,15 +129,35 @@ class SessionManager:
     async def reset(self, session: str) -> int:
         """Retire every site and proxy entry for one exact normalized session."""
         async with self._map_lock:
+            self._session_generations[session] = (
+                self._session_generations.get(session, 0) + 1
+            )
             entries = [
                 entry for entry in self._owned.values() if entry.key.session == session
             ]
+            reservations = [
+                reservation
+                for reservation in self._admissions.values()
+                if reservation.key.session == session
+            ]
             tasks = [self._schedule_retirement_locked(entry) for entry in entries]
-        self._log_entries("reset", entries)
-        error = await self._wait_for_retirements(tasks, entries, "reset")
+            tasks.extend(
+                reservation.task
+                for reservation in reservations
+                if reservation.task is not None
+            )
+            snapshot = self._snapshot_locked()
+        keys = {entry.key for entry in entries}
+        keys.update(reservation.key for reservation in reservations)
+        self._log_keys("reset", keys, snapshot)
+        error = await self._wait_for_retirements(
+            list(dict.fromkeys(tasks)),
+            next(iter(keys), None),
+            "reset",
+        )
         if error is not None:
             raise error
-        return len(entries)
+        return len(keys)
 
     async def expire_idle(self) -> int:
         """Retire entries idle for at least the configured monotonic TTL."""
@@ -137,8 +172,11 @@ class SessionManager:
                 and now - entry.last_used >= self._ttl_seconds
             ]
             tasks = [self._schedule_retirement_locked(entry) for entry in entries]
-        self._log_entries("expire", entries)
-        error = await self._wait_for_retirements(tasks, entries, "expire")
+            snapshot = self._snapshot_locked()
+        self._log_entries("expire", entries, snapshot)
+        error = await self._wait_for_retirements(
+            tasks, entries[0].key if entries else None, "expire"
+        )
         if error is not None:
             raise error
         return len(entries)
@@ -150,30 +188,36 @@ class SessionManager:
             if entry is None:
                 return False
             self._schedule_retirement_locked(entry)
-        log_session_event(logging.DEBUG, "invalidate", key)
+            snapshot = self._snapshot_locked()
+        log_session_event(logging.DEBUG, "invalidate", key, snapshot=snapshot)
         return True
 
     async def close(self) -> None:
         """Reject new leases and boundedly await all manager-owned cleanup."""
-        task, entries, started = await self._begin_shutdown()
+        task, entries, started, snapshot = await self._begin_shutdown()
         if started:
-            self._log_entries("shutdown", entries)
+            self._log_entries("shutdown", entries, snapshot)
         key = entries[0].key if entries else None
         error = await self._wait_for_task(task, key, "shutdown")
         if error is not None:
             raise error
 
-    async def _claim_entry(self, key: SessionKey, proxy: ProxySettings) -> SessionEntry:
+    async def _claim_entry(
+        self, key: SessionKey, proxy: ProxySettings, generation: int
+    ) -> SessionEntry:
         """Reserve one claim without losing ownership of retiring resources."""
         while True:
             async with self._map_lock:
-                decision = self._decide_claim_locked(key, proxy)
+                if self._session_generations.get(key.session, 0) != generation:
+                    raise SessionResetError
+                decision = self._decide_claim_locked(key, proxy, generation)
+                snapshot = self._snapshot_locked()
             if decision.event is not None:
-                log_session_event(logging.DEBUG, decision.event, key)
+                log_session_event(logging.DEBUG, decision.event, key, snapshot=snapshot)
             if decision.result is not None:
                 return decision.result
             if decision.capacity_rejected:
-                log_session_event(logging.WARNING, "capacity", key)
+                log_session_event(logging.WARNING, "capacity", key, snapshot=snapshot)
                 raise SessionCapacityError
             if decision.barrier is not None:
                 await self._wait_for_event(decision.barrier.retired, key, "replacement")
@@ -181,7 +225,12 @@ class SessionManager:
             reservation = decision.reservation
             assert reservation is not None
             if decision.eviction is not None:
-                log_session_event(logging.DEBUG, "evict", decision.eviction.key)
+                log_session_event(
+                    logging.DEBUG,
+                    "evict",
+                    decision.eviction.key,
+                    snapshot=snapshot,
+                )
             reservation_task = reservation.task
             assert reservation_task is not None
             error = await self._wait_for_task(reservation_task, key, "evict")
@@ -189,7 +238,7 @@ class SessionManager:
                 raise error
 
     def _decide_claim_locked(
-        self, key: SessionKey, proxy: ProxySettings
+        self, key: SessionKey, proxy: ProxySettings, generation: int
     ) -> ClaimDecision:
         """Mutate admission atomically and return logging/wait work for later."""
         if self._closed:
@@ -211,7 +260,11 @@ class SessionManager:
             if eviction is None:
                 return ClaimDecision(capacity_rejected=True)
             self._schedule_retirement_locked(eviction)
-            reservation = AdmissionReservation(key=key, victim=eviction)
+            reservation = AdmissionReservation(
+                key=key,
+                victim=eviction,
+                generation=generation,
+            )
             self._admissions[key] = reservation
             reservation.task = asyncio.create_task(
                 self._finish_admission(reservation, proxy)
@@ -244,15 +297,26 @@ class SessionManager:
         assert retirement_task is not None
         error = await asyncio.shield(retirement_task)
         created = False
+        snapshot: SessionPoolSnapshot | None = None
         async with self._map_lock:
             if self._admissions.get(reservation.key) is not reservation:
                 return error
             self._admissions.pop(reservation.key)
-            if error is None and not self._closed:
+            current_generation = self._session_generations.get(
+                reservation.key.session, 0
+            )
+            if (
+                error is None
+                and not self._closed
+                and current_generation == reservation.generation
+            ):
                 self._new_entry_locked(reservation.key, proxy, claims=0)
                 created = True
+            snapshot = self._snapshot_locked()
         if created:
-            log_session_event(logging.DEBUG, "create", reservation.key)
+            log_session_event(
+                logging.DEBUG, "create", reservation.key, snapshot=snapshot
+            )
         return error
 
     async def _open_entry(
@@ -268,9 +332,15 @@ class SessionManager:
             open_task.cancel()
             async with self._map_lock:
                 self._schedule_retirement_locked(entry)
+                snapshot = self._snapshot_locked()
             error = SessionLifecycleTimeoutError()
             log_session_event(
-                logging.WARNING, "timeout", entry.key, error, reason="open"
+                logging.WARNING,
+                "timeout",
+                entry.key,
+                error,
+                reason="open",
+                snapshot=snapshot,
             )
             return OpenResult(error=error)
         except BaseException as error:
@@ -293,6 +363,9 @@ class SessionManager:
                 entry.touch_order = self._next_touch_order()
             if entry.claims == 0:
                 entry.drained.set()
+            snapshot = self._snapshot_locked()
+            event = "idle" if entry.claims == 0 else "busy"
+        log_session_event(logging.DEBUG, event, entry.key, snapshot=snapshot)
 
     def _lru_idle_entry_locked(self) -> SessionEntry | None:
         """Select the stable least-recently-used admitted idle entry."""
@@ -314,6 +387,30 @@ class SessionManager:
             for reservation in self._admissions.values()
         )
         return len(self._owned) + released_reservations
+
+    def _snapshot_locked(self) -> SessionPoolSnapshot:
+        """Capture aggregate state for logging after the map lock is released."""
+        active_entries = list(self._entries.values())
+        idle_count = sum(entry.claims == 0 for entry in active_entries)
+        busy_count = sum(entry.claims > 0 for entry in active_entries)
+        opening_count = sum(
+            entry.creation_task is not None and not entry.creation_task.done()
+            for entry in active_entries
+        )
+        active_ids = {id(entry) for entry in active_entries}
+        retiring_count = sum(
+            id(entry) not in active_ids for entry in self._owned.values()
+        )
+        return SessionPoolSnapshot(
+            active_count=len(active_entries),
+            idle_count=idle_count,
+            busy_count=busy_count,
+            opening_count=opening_count,
+            retiring_count=retiring_count,
+            admission_count=len(self._admissions),
+            capacity_count=self._capacity_count_locked(),
+            capacity_limit=self._max_sessions,
+        )
 
     def _schedule_retirement_locked(
         self, entry: SessionEntry
@@ -352,7 +449,9 @@ class SessionManager:
         return await self._close_resource(resource)
 
     @staticmethod
-    async def _close_resource(resource) -> BaseException | None:
+    async def _close_resource(
+        resource: ManagedBrowserResource,
+    ) -> BaseException | None:
         """Close to terminal state while retaining cleanup errors as results."""
         try:
             await resource.close()
@@ -379,11 +478,17 @@ class SessionManager:
         asyncio.Task[BaseException | None],
         list[SessionEntry],
         bool,
+        SessionPoolSnapshot,
     ]:
         """Atomically reject acquisition and start one unbounded owned drain."""
         async with self._map_lock:
             if self._shutdown_task is not None:
-                return self._shutdown_task, list(self._owned.values()), False
+                return (
+                    self._shutdown_task,
+                    list(self._owned.values()),
+                    False,
+                    self._snapshot_locked(),
+                )
             self._closed = True
             entries = list(self._owned.values())
             tasks = [self._schedule_retirement_locked(entry) for entry in entries]
@@ -393,7 +498,7 @@ class SessionManager:
                 if reservation.task is not None
             )
             self._shutdown_task = asyncio.create_task(self._finish_shutdown(tasks))
-            return self._shutdown_task, entries, True
+            return self._shutdown_task, entries, True, self._snapshot_locked()
 
     @staticmethod
     async def _finish_shutdown(
@@ -408,14 +513,13 @@ class SessionManager:
     async def _wait_for_retirements(
         self,
         tasks: list[asyncio.Task[BaseException | None]],
-        entries: list[SessionEntry],
+        key: SessionKey | None,
         reason: str,
     ) -> BaseException | None:
         """Bound a caller's aggregate wait without cancelling owned retirement."""
         if not tasks:
             return None
         waiter = asyncio.create_task(self._finish_shutdown(tasks))
-        key = entries[0].key if entries else None
         try:
             return await self._wait_for_task(waiter, key, reason)
         finally:
@@ -453,7 +557,7 @@ class SessionManager:
             await self._cancel_ephemeral_task(waiter)
 
     @staticmethod
-    async def _cancel_ephemeral_task(task: asyncio.Task) -> None:
+    async def _cancel_ephemeral_task(task: asyncio.Task[object]) -> None:
         """Cancel and consume a helper without touching shielded owned work."""
         if not task.done():
             task.cancel()
@@ -461,10 +565,24 @@ class SessionManager:
             await task
 
     @staticmethod
-    def _log_entries(event: str, entries: list[SessionEntry]) -> None:
+    def _log_entries(
+        event: str,
+        entries: list[SessionEntry],
+        snapshot: SessionPoolSnapshot | None = None,
+    ) -> None:
         """Emit staged ownership reasons only after releasing the map lock."""
         for entry in entries:
-            log_session_event(logging.DEBUG, event, entry.key)
+            log_session_event(logging.DEBUG, event, entry.key, snapshot=snapshot)
+
+    @staticmethod
+    def _log_keys(
+        event: str,
+        keys: set[SessionKey],
+        snapshot: SessionPoolSnapshot | None = None,
+    ) -> None:
+        """Emit staged ownership reasons only after releasing the map lock."""
+        for key in keys:
+            log_session_event(logging.DEBUG, event, key, snapshot=snapshot)
 
     def _next_touch_order(self) -> int:
         self._touch_order += 1

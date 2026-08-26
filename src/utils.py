@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import Header, HTTPException
 from pydantic import BaseModel, Field
 
-from src.browser import BrowserDepClass, BrowserFactory
+from src.browser import BrowserDepClass, BrowserFactory, is_fatal_browser_error
 from src.consts import (
     LOG_LEVEL,
     PROXY_PASSWORD,
@@ -122,6 +122,11 @@ async def get_request_browser(
         raise RuntimeError(SESSION_LIFESPAN_REQUIRED_MESSAGE)
     try:
         async with manager.acquire(key, proxy) as browser:
-            yield browser
+            try:
+                yield browser
+            except BaseException as error:
+                if is_fatal_browser_error(error):
+                    await manager.invalidate(key)
+                raise
     except SessionCapacityError as error:
         raise HTTPException(status_code=503, detail=SESSION_CAPACITY_MESSAGE) from error

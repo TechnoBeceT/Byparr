@@ -1,13 +1,17 @@
 import time
 import warnings
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Route
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from src.browser import is_fatal_browser_error
 from src.challenge import challenge_present, solve_challenge
 from src.content import build_response_content
 from src.models import (
@@ -64,51 +68,50 @@ async def read_item(request: LinkRequest, dep: BrowserDepClass) -> LinkResponse:
     timer = TimeoutTimer(duration=request.max_timeout)
     request.url = request.url.replace('"', "").strip()
 
-    await setup_routes(request, dep)
+    async with setup_routes(request, dep):
+        try:
+            challenge_detected, page_html, page_request = await _navigate_and_solve(
+                dep, request, timer
+            )
+        except (TimeoutError, PlaywrightTimeoutError) as e:
+            logger.error("Timed out while loading the page or solving the challenge")
+            raise HTTPException(
+                status_code=408,
+                detail="Timed out while loading the page or solving the challenge",
+            ) from e
+        except PlaywrightError as e:
+            logger.error("Could not reach the target: %s", e)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not reach the target: {e}",
+            ) from e
 
-    try:
-        challenge_detected, page_html, page_request = await _navigate_and_solve(
-            dep, request, timer
+        cookies = await dep.context.cookies()
+        content_type, response_content = await build_response_content(
+            dep.page,
+            request,
+            page_request,
+            challenge_detected=challenge_detected,
+            page_html=page_html,
         )
-    except (TimeoutError, PlaywrightTimeoutError) as e:
-        logger.error("Timed out while loading the page or solving the challenge")
-        raise HTTPException(
-            status_code=408,
-            detail="Timed out while loading the page or solving the challenge",
-        ) from e
-    except PlaywrightError as e:
-        logger.error("Could not reach the target: %s", e)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not reach the target: {e}",
-        ) from e
 
-    cookies = await dep.context.cookies()
-    content_type, response_content = await build_response_content(
-        dep.page,
-        request,
-        page_request,
-        challenge_detected=challenge_detected,
-        page_html=page_html,
-    )
+        user_agent = (
+            page_request.request.headers.get("user-agent") or "" if page_request else ""
+        )
 
-    user_agent = (
-        page_request.request.headers.get("user-agent") or "" if page_request else ""
-    )
-
-    return LinkResponse(
-        message="Success",
-        solution=Solution(
-            user_agent=user_agent,
-            url=dep.page.url,
-            status=HTTPStatus.OK,
-            cookies=cookies,
-            headers=page_request.headers if page_request else {},
-            response=response_content,
-            content_type=content_type,
-        ),
-        start_timestamp=start_time,
-    )
+        return LinkResponse(
+            message="Success",
+            solution=Solution(
+                user_agent=user_agent,
+                url=dep.page.url,
+                status=HTTPStatus.OK,
+                cookies=cookies,
+                headers=page_request.headers if page_request else {},
+                response=response_content,
+                content_type=content_type,
+            ),
+            start_timestamp=start_time,
+        )
 
 
 @router.post("/v1", response_model_exclude_none=True)
@@ -134,27 +137,47 @@ async def handle_v1(
         return SessionResponse(
             message="The session has been removed.", start_timestamp=start_time
         )
-    async with get_request_browser(
-        request,
-        getattr(app_request.app.state, "session_manager", None),
-        x_proxy_server=x_proxy_server,
-        x_proxy_username=x_proxy_username,
-        x_proxy_password=x_proxy_password,
-    ) as dep:
-        return await read_item(request, dep)
+    try:
+        async with get_request_browser(
+            request,
+            getattr(app_request.app.state, "session_manager", None),
+            x_proxy_server=x_proxy_server,
+            x_proxy_username=x_proxy_username,
+            x_proxy_password=x_proxy_password,
+        ) as dep:
+            return await read_item(request, dep)
+    except HTTPException:
+        raise
+    except BaseException as error:
+        if not is_fatal_browser_error(error):
+            raise
+        logger.error("The browser resource closed while handling the request")
+        raise HTTPException(
+            status_code=502,
+            detail="The browser resource closed while handling the request",
+        ) from error
 
 
-async def setup_routes(request: LinkRequest, dep: BrowserDep) -> None:
-    """Install request routes for media blocking."""
-    if request.block_media:
+@asynccontextmanager
+async def setup_routes(
+    request: LinkRequest, dep: BrowserDepClass
+) -> AsyncGenerator[None]:
+    """Own the media-blocking route for exactly one request."""
+    if not request.block_media:
+        yield
+        return
 
-        async def block_media_route(route) -> None:
-            if route.request.resource_type in ("image", "media", "font"):
-                await route.abort()
-            else:
-                await route.continue_()
+    async def block_media_route(route: Route) -> None:
+        if route.request.resource_type in ("image", "media", "font"):
+            await route.abort()
+        else:
+            await route.continue_()
 
-        await dep.page.route("**/*", block_media_route)
+    await dep.page.route("**/*", block_media_route)
+    try:
+        yield
+    finally:
+        await dep.page.unroute("**/*", block_media_route)
 
 
 async def _navigate_and_solve(

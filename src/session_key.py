@@ -32,6 +32,20 @@ def build_session_key(
     """Build a site- and proxy-isolated key for an optional session name."""
     if session is None:
         return None
+    site = _site_from_url(url)
+    return SessionKey(session=session, site=site, proxy_id=proxy.identity)
+
+
+def safe_site_label(url: str) -> str:
+    """Return a path- and credential-free site label for operational logs."""
+    try:
+        return _site_from_url(url)
+    except ValueError:
+        return "invalid-target"
+
+
+def _site_from_url(url: str) -> str:
+    """Validate an absolute URL and return its normalized site identity."""
     if "\\" in url:
         raise ValueError(INVALID_SESSION_URL_MESSAGE)
 
@@ -49,8 +63,7 @@ def build_session_key(
     if hostname is None:
         raise ValueError(INVALID_SESSION_URL_MESSAGE)
 
-    site = _session_site(hostname)
-    return SessionKey(session=session, site=site, proxy_id=proxy.identity)
+    return _session_site(hostname)
 
 
 def _session_site(hostname: str) -> str:

@@ -5,12 +5,16 @@ import base64
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from json import JSONDecodeError
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx2
 import pytest
 from fastapi import HTTPException
+from httpx import ASGITransport, AsyncClient
+from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import ValidationError
 from starlette.testclient import TestClient
@@ -21,7 +25,8 @@ from src.challenge import CF_INTERSTITIAL_INDICATORS_SELECTORS
 from src.consts import VERSION
 from src.endpoints import read_item
 from src.models import LinkRequest
-from src.sessions import SessionCapacityError
+from src.proxy import ProxySettings
+from src.sessions import SessionCapacityError, SessionManager
 from src.utils import BrowserDepClass, TimeoutTimer, remaining_ms
 
 client = TestClient(app)
@@ -143,9 +148,9 @@ def test_pdf_handling():
         ({}, 60),  # default
     ],
 )
-def test_max_timeout_normalization(payload: dict, expected: int):
+def test_max_timeout_normalization(payload: dict[str, int], expected: int) -> None:
     """MaxTimeout must accept FlareSolverr's milliseconds while keeping seconds."""
-    request = LinkRequest(url="https://example.com", **payload)
+    request = LinkRequest.model_validate({"url": "https://example.com", **payload})
     assert request.max_timeout == expected
 
 
@@ -201,7 +206,7 @@ class EndpointResource:
     """A disposable browser resource with a stable cookie per context."""
 
     def __init__(self, number: int) -> None:
-        self.page = fake_dep().page
+        self.page = cast("AsyncMock", fake_dep().page)
         self.context = AsyncMock()
         self.context.cookies.return_value = [
             {
@@ -224,9 +229,44 @@ class EndpointFactory:
     def __init__(self) -> None:
         self.resources: list[EndpointResource] = []
 
-    async def open(self, _proxy: object) -> EndpointResource:
+    async def open(self, proxy: ProxySettings) -> EndpointResource:
+        _ = proxy
         resource = EndpointResource(len(self.resources) + 1)
         self.resources.append(resource)
+        return resource
+
+
+class FatalEndpointFactory(EndpointFactory):
+    """Make the first retained resource close fatally at one request stage."""
+
+    def __init__(self, stage: str) -> None:
+        super().__init__()
+        self.stage = stage
+
+    async def open(self, proxy: ProxySettings) -> EndpointResource:
+        resource = await super().open(proxy)
+        if len(self.resources) != 1:
+            return resource
+        error = TargetClosedError("browser has been closed")
+        if self.stage == "routes":
+            resource.page.route.side_effect = error
+        elif self.stage == "navigation":
+            resource.page.goto.side_effect = error
+        elif self.stage == "cookies":
+            resource.context.cookies.side_effect = error
+        return resource
+
+
+class RecoverableEndpointFactory(EndpointFactory):
+    """Fail one navigation without closing the retained browser target."""
+
+    async def open(self, proxy: ProxySettings) -> EndpointResource:
+        resource = await super().open(proxy)
+        successful_navigation = resource.page.goto.return_value
+        resource.page.goto.side_effect = [
+            PlaywrightError("NS_ERROR_UNKNOWN_HOST"),
+            successful_navigation,
+        ]
         return resource
 
 
@@ -302,6 +342,150 @@ def test_named_session_reuses_its_site_but_isolates_other_sites(
     )
     assert len(factory.resources) == 2
     assert [resource.close.await_count for resource in factory.resources] == [1, 1]
+
+
+@pytest.mark.parametrize("fatal_stage", ["routes", "navigation", "cookies", "content"])
+@pytest.mark.asyncio
+async def test_fatal_browser_failure_retires_the_retained_resource(
+    monkeypatch: pytest.MonkeyPatch,
+    fatal_stage: str,
+) -> None:
+    """A closed Playwright target is never reused by the next HTTP request."""
+    from src import endpoints
+
+    factory = FatalEndpointFactory(fatal_stage)
+    manager = SessionManager(factory)
+    app.state.session_manager = manager
+    if fatal_stage == "content":
+        original = endpoints.build_response_content
+        first_call = True
+
+        async def fail_first_content(
+            page: Page,
+            request: LinkRequest,
+            page_request: object,
+            *,
+            challenge_detected: bool,
+            page_html: str | None,
+        ) -> tuple[str, str]:
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                raise TargetClosedError("browser has been closed")
+            return await original(
+                page,
+                request,
+                page_request,
+                challenge_detected=challenge_detected,
+                page_html=page_html,
+            )
+
+        monkeypatch.setattr(endpoints, "build_response_content", fail_first_content)
+
+    payload = {
+        "url": "https://example.test/one",
+        "session": "account",
+        "blockMedia": fatal_stage == "routes",
+    }
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post("/v1", json=payload)
+        second = await client.post("/v1", json=payload)
+    await manager.close()
+
+    assert [first.status_code, second.status_code] == [
+        HTTPStatus.BAD_GATEWAY,
+        HTTPStatus.OK,
+    ]
+    assert len(factory.resources) == 2
+    assert [resource.close.await_count for resource in factory.resources] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_block_media_routes_do_not_persist_or_accumulate_on_a_reused_page() -> (
+    None
+):
+    """Each enabled request removes exactly the handler it installed."""
+    dep = fake_dep()
+
+    await read_item(LinkRequest(url="https://example.test/one", blockMedia=True), dep)
+    await read_item(LinkRequest(url="https://example.test/two", blockMedia=False), dep)
+    await read_item(LinkRequest(url="https://example.test/three", blockMedia=True), dep)
+
+    page = cast("AsyncMock", dep.page)
+    assert page.route.await_count == 2
+    assert page.unroute.await_count == 2
+    installed = [call.args[1] for call in page.route.await_args_list]
+    removed = [call.args[1] for call in page.unroute.await_args_list]
+    assert removed == installed
+
+
+@pytest.mark.asyncio
+async def test_block_media_route_is_removed_when_navigation_is_cancelled() -> None:
+    """Cancellation cannot leave a request-owned handler on a retained page."""
+    dep = fake_dep()
+    navigation_started = asyncio.Event()
+
+    async def wait_forever(*_args: object, **_kwargs: object) -> None:
+        navigation_started.set()
+        await asyncio.Event().wait()
+
+    page = cast("AsyncMock", dep.page)
+    page.goto.side_effect = wait_forever
+    reading = asyncio.create_task(
+        read_item(LinkRequest(url="https://example.test", blockMedia=True), dep)
+    )
+    await navigation_started.wait()
+    reading.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+
+    handler = page.route.await_args.args[1]
+    page.unroute.assert_awaited_once_with("**/*", handler)
+
+
+@pytest.mark.asyncio
+async def test_block_media_route_is_removed_when_navigation_fails() -> None:
+    """A recoverable navigation error cannot leak a request-owned route."""
+    dep = fake_dep()
+    page = cast("AsyncMock", dep.page)
+    page.goto.side_effect = PlaywrightError("NS_ERROR_UNKNOWN_HOST")
+
+    with pytest.raises(HTTPException) as failure:
+        await read_item(LinkRequest(url="https://nope.invalid", blockMedia=True), dep)
+
+    assert failure.value.status_code == HTTPStatus.BAD_GATEWAY
+    handler = page.route.await_args.args[1]
+    page.unroute.assert_awaited_once_with("**/*", handler)
+
+
+@pytest.mark.asyncio
+async def test_recoverable_navigation_failure_preserves_the_retained_resource() -> None:
+    """Ordinary source failures keep clearance state available for retry."""
+    factory = RecoverableEndpointFactory()
+    manager = SessionManager(factory)
+    app.state.session_manager = manager
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post(
+            "/v1",
+            json={"url": "https://example.test/one", "session": "account"},
+        )
+        second = await client.post(
+            "/v1",
+            json={"url": "https://example.test/two", "session": "account"},
+        )
+
+    await manager.close()
+
+    assert [first.status_code, second.status_code] == [
+        HTTPStatus.BAD_GATEWAY,
+        HTTPStatus.OK,
+    ]
+    assert len(factory.resources) == 1
+    factory.resources[0].close.assert_awaited_once()
 
 
 def test_blank_sessions_remain_disposable(monkeypatch: pytest.MonkeyPatch) -> None:

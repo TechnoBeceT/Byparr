@@ -6,13 +6,26 @@ import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple, Protocol, cast
 
 from invisible_playwright.async_api import InvisiblePlaywright
+from playwright._impl._errors import is_target_closed_error
 from playwright.async_api import Browser, BrowserContext, Page
 
 from src.consts import BROWSER_LOCALE
 from src.proxy import ProxySettings
+
+
+def is_fatal_browser_error(error: BaseException) -> bool:
+    """Classify Playwright's closed page, context, or browser failures."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, Exception) and is_target_closed_error(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class BrowserDepClass(NamedTuple):
@@ -20,6 +33,32 @@ class BrowserDepClass(NamedTuple):
 
     page: Page
     context: BrowserContext
+
+
+class ManagedBrowserResource(Protocol):
+    """The lifecycle surface retained by the session manager."""
+
+    @property
+    def page(self) -> object:
+        """Return the resource's page handle."""
+        ...
+
+    @property
+    def context(self) -> object:
+        """Return the resource's context handle."""
+        ...
+
+    async def close(self) -> None:
+        """Close every resource owned by this handle."""
+        ...
+
+
+class BrowserFactoryProtocol(Protocol):
+    """Create one manager-owned browser resource for a selected proxy."""
+
+    async def open(self, proxy: ProxySettings) -> ManagedBrowserResource:
+        """Open a resource."""
+        ...
 
 
 @dataclass

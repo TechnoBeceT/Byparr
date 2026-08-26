@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
-from src.browser import BrowserResource
+from src.browser import ManagedBrowserResource
 from src.session_key import SessionKey
 
 
@@ -33,11 +33,33 @@ class SessionProxyMismatchError(ValueError):
         super().__init__("session key proxy identity does not match supplied proxy")
 
 
+class SessionResetError(RuntimeError):
+    """Raised when a reset fences an acquisition that started earlier."""
+
+    def __init__(self) -> None:
+        """Describe the ownership change without exposing the session name."""
+        super().__init__("browser session was reset during admission")
+
+
+@dataclass(frozen=True)
+class SessionPoolSnapshot:
+    """A bounded aggregate view of manager-owned browser resources."""
+
+    active_count: int
+    idle_count: int
+    busy_count: int
+    opening_count: int
+    retiring_count: int
+    admission_count: int
+    capacity_count: int
+    capacity_limit: int
+
+
 @dataclass
 class OpenResult:
     """The captured outcome of one manager-owned browser creation."""
 
-    resource: BrowserResource | None = None
+    resource: ManagedBrowserResource | None = None
     error: BaseException | None = None
 
 
@@ -53,8 +75,8 @@ class SessionEntry:
     retired: asyncio.Event = field(default_factory=asyncio.Event)
     claims: int = 1
     invalidated: bool = False
-    resource: BrowserResource | None = None
-    open_task: asyncio.Task[BrowserResource] | None = None
+    resource: ManagedBrowserResource | None = None
+    open_task: asyncio.Task[ManagedBrowserResource] | None = None
     creation_task: asyncio.Task[OpenResult] | None = None
     retirement_task: asyncio.Task[BaseException | None] | None = None
     terminal_error: BaseException | None = None
@@ -66,6 +88,7 @@ class AdmissionReservation:
 
     key: SessionKey
     victim: SessionEntry
+    generation: int
     task: asyncio.Task[BaseException | None] | None = None
 
 

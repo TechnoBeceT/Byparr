@@ -1,13 +1,18 @@
 # ruff: noqa: D102, D103, D105, D107, S106
 
+from __future__ import annotations
+
 import asyncio
 import gc
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
+from contextlib import AbstractAsyncContextManager
+from typing import Any, cast
 
 import pytest
+from playwright.async_api import BrowserContext, Page
 
 from src import utils
-from src.browser import BrowserFactory
+from src.browser import BrowserFactory, ManagedBrowserResource
 from src.proxy import ProxySettings
 
 
@@ -89,11 +94,11 @@ class FakePlaywrightScope:
 
 
 class FakeBrowserFactory:
-    def __init__(self, resource) -> None:
+    def __init__(self, resource: ManagedBrowserResource) -> None:
         self.resource = resource
         self.proxies: list[ProxySettings] = []
 
-    async def open(self, proxy: ProxySettings):
+    async def open(self, proxy: ProxySettings) -> ManagedBrowserResource:
         self.proxies.append(proxy)
         return self.resource
 
@@ -108,8 +113,15 @@ class FakeResource:
         self.close_calls += 1
 
 
-def make_factory(scope: FakePlaywrightScope):
-    return BrowserFactory(playwright_factory=lambda **_: scope)
+def make_factory(scope: FakePlaywrightScope) -> BrowserFactory:
+    def build_scope(**_: object) -> FakePlaywrightScope:
+        return scope
+
+    factory = cast(
+        "Callable[..., AbstractAsyncContextManager[Any]]",
+        build_scope,
+    )
+    return BrowserFactory(playwright_factory=factory)
 
 
 @pytest.mark.asyncio
@@ -313,7 +325,9 @@ async def test_disposable_browser_dependency_closes_resource_on_every_exit(
         x_proxy_password="header-password",
     )
     dependency_value = await anext(dependency)
-    assert dependency_value == utils.BrowserDepClass(resource.page, resource.context)
+    assert dependency_value == utils.BrowserDepClass(
+        cast("Page", resource.page), cast("BrowserContext", resource.context)
+    )
 
     if finish == "normal":
         await dependency.aclose()

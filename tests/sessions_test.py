@@ -1,10 +1,13 @@
-# ruff: noqa: ANN002, ANN003, D102, D103, D105, D107, PLR2004, S105
+# ruff: noqa: D102, D103, D105, D107, PLR2004, S105
 
 from __future__ import annotations
 
 import asyncio
 import logging
 from collections import deque
+from collections.abc import Iterable
+from types import TracebackType
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -58,14 +61,14 @@ class FakeResource:
 
 
 class FakeFactory:
-    def __init__(self, outcomes=()) -> None:
-        self.outcomes = deque(outcomes)
+    def __init__(self, outcomes: Iterable[FakeResource | BaseException] = ()) -> None:
+        self.outcomes: deque[FakeResource | BaseException] = deque(outcomes)
         self.calls: list[ProxySettings] = []
         self.open_started = asyncio.Event()
         self.allow_open: asyncio.Event | None = None
         self.resources: list[FakeResource] = []
 
-    async def open(self, proxy: ProxySettings):
+    async def open(self, proxy: ProxySettings) -> FakeResource:
         self.calls.append(proxy)
         self.open_started.set()
         if self.allow_open is not None:
@@ -147,11 +150,12 @@ class CancellingOpenFactory:
         self.allow_cleanup = asyncio.Event()
         self.cleanup_finished = asyncio.Event()
 
-    async def open(self, proxy: ProxySettings):
+    async def open(self, proxy: ProxySettings) -> FakeResource:
         self.calls.append(proxy)
         self.started.set()
         try:
             await asyncio.Event().wait()
+            raise AssertionError("unreachable")
         except asyncio.CancelledError:
             self.cancelled.set()
             await self.allow_cleanup.wait()
@@ -161,7 +165,7 @@ class CancellingOpenFactory:
 
 class ImmediateTimeout:
     def __init__(self) -> None:
-        self.task: asyncio.Task | None = None
+        self.task: asyncio.Task[object] | None = None
         self.cancellation: asyncio.Handle | None = None
 
     async def __aenter__(self) -> None:
@@ -169,7 +173,12 @@ class ImmediateTimeout:
         assert self.task is not None
         self.cancellation = asyncio.get_running_loop().call_soon(self.task.cancel)
 
-    async def __aexit__(self, error_type, _error, _traceback) -> bool:
+    async def __aexit__(
+        self,
+        error_type: type[BaseException] | None,
+        _error: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> bool:
         if self.cancellation is not None:
             self.cancellation.cancel()
         if error_type is asyncio.CancelledError:
@@ -190,10 +199,10 @@ async def next_turn() -> None:
     await reached.wait()
 
 
-def pending_coroutines(name: str) -> list[asyncio.Task]:
+def pending_coroutines(name: str) -> list[asyncio.Task[object]]:
     current = asyncio.current_task()
     return [
-        task
+        cast("asyncio.Task[object]", task)
         for task in asyncio.all_tasks()
         if task is not current
         and not task.done()
@@ -565,6 +574,37 @@ async def test_close_waits_for_and_suppresses_pending_admission() -> None:
     assert results[1] is None
     assert len(factory.calls) == 1
     assert factory.tracker.live == 0
+
+
+@pytest.mark.asyncio
+async def test_reset_fences_a_matching_pending_admission() -> None:
+    factory = CapacityFactory(blocked_resources=1)
+    manager = SessionManager(factory, max_sessions=1)
+    destination = key("account-a", "new.example")
+
+    async with manager.acquire(key("old", "old.example"), ProxySettings.direct()):
+        pass
+
+    async def lease_destination() -> None:
+        async with manager.acquire(destination, ProxySettings.direct()):
+            pass
+
+    acquiring = asyncio.create_task(lease_destination())
+    await factory.close_started[0].wait()
+    resetting = asyncio.create_task(manager.reset("account-a"))
+    await next_turn()
+
+    assert not resetting.done()
+
+    factory.allow_close.set()
+    results = await asyncio.gather(acquiring, resetting, return_exceptions=True)
+
+    assert isinstance(results[0], RuntimeError)
+    assert "reset" in str(results[0])
+    assert results[1] == 1
+    assert len(factory.calls) == 1
+    assert factory.tracker.live == 0
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -1060,8 +1100,9 @@ async def test_lifecycle_logging_never_runs_under_the_admission_lock(
     session_key = key("account-a", "example.com")
     lock_states: list[bool] = []
 
-    def capture_log(*_args, **_kwargs) -> None:
-        lock_states.append(manager._map_lock.locked())  # noqa: SLF001
+    def capture_log(*_args: object, **_kwargs: object) -> None:
+        lock = cast("asyncio.Lock", vars(manager)["_map_lock"])
+        lock_states.append(lock.locked())
 
     monkeypatch.setattr(sessions, "log_session_event", capture_log)
     async with manager.acquire(session_key, ProxySettings.direct()):
@@ -1083,7 +1124,7 @@ async def test_lifecycle_logs_distinguish_every_ownership_reason(
     manager = SessionManager(FakeFactory(), ttl_seconds=1, max_sessions=1, clock=clock)
     events: list[str] = []
 
-    def capture_log(_level, event: str, *_args, **_kwargs) -> None:
+    def capture_log(_level: int, event: str, *_args: object, **_kwargs: object) -> None:
         events.append(event)
 
     monkeypatch.setattr(sessions, "log_session_event", capture_log)
@@ -1194,3 +1235,41 @@ async def test_lifecycle_logs_contain_only_sanitized_digests(
         assert secret not in rendered
         assert secret not in serialized
     assert any(hasattr(record, "session_digest") for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_logs_publish_bounded_pool_state_counts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = SessionManager(FakeFactory(), max_sessions=2)
+    session_key = key("private-account", "example.com")
+
+    with caplog.at_level(logging.DEBUG, logger="src.sessions"):
+        async with manager.acquire(session_key, ProxySettings.direct()):
+            pass
+        await manager.close()
+
+    records: dict[str, dict[str, object]] = {
+        str(record.__dict__.get("event", "")): record.__dict__
+        for record in caplog.records
+        if record.getMessage() == "browser_session_lifecycle"
+    }
+
+    def count(event: str, field: str) -> int:
+        value = records[event][field]
+        assert isinstance(value, int)
+        return value
+
+    assert {"create", "idle", "shutdown"}.issubset(records)
+    assert count("create", "active_count") == 1
+    assert count("create", "busy_count") == 1
+    assert count("create", "idle_count") == 0
+    assert count("idle", "active_count") == 1
+    assert count("idle", "busy_count") == 0
+    assert count("idle", "idle_count") == 1
+    assert count("shutdown", "active_count") == 0
+    assert count("shutdown", "retiring_count") == 1
+    for event in records:
+        assert 0 <= count(event, "active_count") <= 2
+        assert 0 <= count(event, "idle_count") <= 2
+        assert 0 <= count(event, "busy_count") <= 2
