@@ -53,18 +53,19 @@ def build_session_key(
 
 def _session_site(hostname: str) -> str:
     """Return the registrable domain, or a normalized IP address for IP hosts."""
-    candidate = hostname.removesuffix(".")
-    if not candidate or candidate.endswith("."):
-        raise ValueError(INVALID_SESSION_URL_MESSAGE)
+    ip_candidate = hostname.removesuffix(".")
     try:
-        return str(ipaddress.ip_address(candidate))
+        return str(ipaddress.ip_address(ip_candidate))
     except ValueError:
         pass
     try:
-        normalized = idna.encode(candidate, uts46=True, transitional=False).decode(
+        normalized = idna.encode(hostname, uts46=True, transitional=False).decode(
             "ascii"
         )
     except idna.IDNAError as exc:
         raise ValueError(INVALID_SESSION_URL_MESSAGE) from exc
-    extracted = _PUBLIC_SUFFIX_EXTRACTOR(normalized)
-    return extracted.top_domain_under_public_suffix or normalized
+    candidate = normalized.removesuffix(".")
+    if not candidate or candidate.endswith("."):
+        raise ValueError(INVALID_SESSION_URL_MESSAGE)
+    extracted = _PUBLIC_SUFFIX_EXTRACTOR(candidate)
+    return extracted.top_domain_under_public_suffix or candidate

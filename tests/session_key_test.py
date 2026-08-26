@@ -54,19 +54,41 @@ def test_session_key_uses_the_registrable_domain() -> None:
     assert left.site == "example.co.uk"
 
 
-def test_session_key_accepts_one_trailing_dns_root_dot() -> None:
+@pytest.mark.parametrize("separator", [".", "\u3002", "\uff0e", "\uff61"])
+def test_session_key_accepts_one_trailing_dns_root_separator(separator: str) -> None:
     proxy = ProxySettings.direct()
 
-    dotted = build_session_key("account-a", "https://reader.example.com.", proxy)
+    dotted = build_session_key(
+        "account-a", f"https://reader.example.com{separator}", proxy
+    )
     plain = build_session_key("account-a", "https://reader.example.com", proxy)
 
     assert dotted == plain
 
 
-@pytest.mark.parametrize("url", ["https://example.com..", "https://example.com..."])
-def test_session_key_rejects_multiple_trailing_dns_root_dots(url: str) -> None:
+@pytest.mark.parametrize(
+    "separators",
+    [
+        "..",
+        "...",
+        "\u3002.",
+        ".\u3002",
+        "\u3002\u3002",
+        "\uff0e.",
+        ".\uff0e",
+        "\uff0e\uff0e",
+        "\uff61.",
+        ".\uff61",
+        "\uff61\uff61",
+    ],
+)
+def test_session_key_rejects_multiple_trailing_dns_root_separators(
+    separators: str,
+) -> None:
     with pytest.raises(ValueError, match=r"absolute HTTP\(S\) URL"):
-        build_session_key("account-a", url, ProxySettings.direct())
+        build_session_key(
+            "account-a", f"https://example.com{separators}", ProxySettings.direct()
+        )
 
 
 def test_session_key_isolated_by_site() -> None:
