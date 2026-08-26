@@ -281,3 +281,16 @@ def test_omitted_session_has_no_session_key() -> None:
 def test_session_key_rejects_urls_without_absolute_http_scheme(url: str) -> None:
     with pytest.raises(ValueError, match=r"absolute HTTP\(S\) URL"):
         build_session_key("account-a", url, ProxySettings.direct())
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        r"https://evil.example\@victim.example",
+        r"https://victim.example\chapter/1",
+        r"https://victim.example/chapter\1",
+    ],
+)
+def test_session_key_rejects_raw_backslashes_anywhere_in_the_url(url: str) -> None:
+    with pytest.raises(ValueError, match=r"absolute HTTP\(S\) URL"):
+        build_session_key("account-a", url, ProxySettings.direct())

@@ -19,7 +19,7 @@ class LogRequest(BaseHTTPMiddleware):
         start_time = time.perf_counter()
         try:
             request_body = LinkRequest.model_validate(await request.json())
-        except JSONDecodeError, ValidationError:
+        except JSONDecodeError, UnicodeDecodeError, ValidationError:
             return await call_next(request)
         logger.info(
             f"From: {request.client.host if request.client else 'unknown'} at {time.strftime('%Y-%m-%d %H:%M:%S')}: {request_body.url}"

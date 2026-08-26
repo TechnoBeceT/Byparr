@@ -32,6 +32,8 @@ def build_session_key(
     """Build a site- and proxy-isolated key for an optional session name."""
     if session is None:
         return None
+    if "\\" in url:
+        raise ValueError(INVALID_SESSION_URL_MESSAGE)
 
     try:
         parsed = urlsplit(url)
