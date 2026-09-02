@@ -8,11 +8,12 @@ from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Protocol, cast
 
-from invisible_playwright.async_api import InvisiblePlaywright
+from camoufox import AsyncCamoufox
 from playwright._impl._errors import is_target_closed_error
 from playwright.async_api import Browser, BrowserContext, Page
+from playwright_captcha import ClickSolver, FrameworkType
 
-from src.consts import BROWSER_LOCALE
+from src.consts import ADDON_PATH, BROWSER_LOCALE, MAX_ATTEMPTS
 from src.proxy import ProxySettings
 
 
@@ -39,6 +40,7 @@ class BrowserDepClass(NamedTuple):
 
     page: Page
     context: BrowserContext
+    solver: ClickSolver
 
 
 class ManagedBrowserResource(Protocol):
@@ -52,6 +54,11 @@ class ManagedBrowserResource(Protocol):
     @property
     def context(self) -> object:
         """Return the resource's context handle."""
+        ...
+
+    @property
+    def solver(self) -> object:
+        """Return the resource's page-bound challenge solver."""
         ...
 
     async def close(self) -> None:
@@ -73,7 +80,9 @@ class BrowserResource:
 
     page: Page
     context: BrowserContext
+    solver: ClickSolver
     _scope: AbstractAsyncContextManager[Browser] = field(repr=False)
+    _solver_scope: AbstractAsyncContextManager[ClickSolver] = field(repr=False)
     _close_task: asyncio.Task[BaseException | None] | None = field(
         default=None, init=False, repr=False
     )
@@ -88,43 +97,51 @@ class BrowserResource:
 
     async def _close_owned(self) -> BaseException | None:
         """Close once and return the first cleanup error without failing the task."""
+        first_error: BaseException | None = None
+        try:
+            await self._solver_scope.__aexit__(None, None, None)
+        except BaseException as error:
+            first_error = error
         try:
             await self.context.close()
         except BaseException as error:
-            with suppress(BaseException):
-                await self._scope.__aexit__(None, None, None)
-            return error
+            first_error = first_error or error
         try:
             await self._scope.__aexit__(None, None, None)
         except BaseException as error:
-            return error
-        return None
+            first_error = first_error or error
+        return first_error
 
 
 class BrowserFactory:
-    """Open independent InvisiblePlaywright resources for selected proxies."""
+    """Open independent Camoufox resources for selected proxies."""
 
     def __init__(
         self,
         playwright_factory: Callable[
             ..., AbstractAsyncContextManager[Any]
-        ] = InvisiblePlaywright,
+        ] = AsyncCamoufox,
+        solver_factory: Callable[
+            ..., AbstractAsyncContextManager[Any]
+        ] = ClickSolver,
     ) -> None:
-        """Configure the InvisiblePlaywright context manager constructor."""
+        """Configure the Camoufox and challenge-solver constructors."""
         self._playwright_factory = playwright_factory
+        self._solver_factory = solver_factory
 
     async def open(self, proxy: ProxySettings) -> BrowserResource:
         """Enter a browser scope and create a context and page within it."""
         scope = self._playwright_factory(
+            main_world_eval=True,
+            addons=[ADDON_PATH],
+            geoip=True,
             headless=True,
             proxy=proxy.as_playwright_proxy(),
             humanize=True,
-            locale=BROWSER_LOCALE or "auto",
-            extra_prefs={
-                "devtools.jsonview.enabled": False,
-                "browser.tabs.remote.useCrossOriginOpenerPolicy": False,
-                "browser.tabs.remote.useCrossOriginEmbedderPolicy": False,
-            },
+            locale=BROWSER_LOCALE or "en-US",
+            i_know_what_im_doing=True,
+            config={"forceScopeAccess": True},
+            disable_coop=True,
         )
         try:
             browser = cast("Browser", await scope.__aenter__())
@@ -138,7 +155,24 @@ class BrowserFactory:
         except BaseException as error:
             await self._close_after_open_failure(scope, context, error)
             raise
-        return BrowserResource(page=page, context=context, _scope=scope)
+        solver_scope = self._solver_factory(
+            framework=FrameworkType.CAMOUFOX,
+            page=page,
+            max_attempts=MAX_ATTEMPTS,
+            attempt_delay=1,
+        )
+        try:
+            solver = cast("ClickSolver", await solver_scope.__aenter__())
+        except BaseException as error:
+            await self._close_after_open_failure(scope, context, error)
+            raise
+        return BrowserResource(
+            page=page,
+            context=context,
+            solver=solver,
+            _scope=scope,
+            _solver_scope=solver_scope,
+        )
 
     @staticmethod
     async def _close_after_open_failure(

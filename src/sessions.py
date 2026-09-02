@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import cast
 
 from playwright.async_api import BrowserContext, Page
+from playwright_captcha import ClickSolver
 
 from src._session_log import log_session_event
 from src._session_state import (
@@ -127,6 +128,7 @@ class SessionManager:
                     yield BrowserDepClass(
                         cast("Page", resource.page),
                         cast("BrowserContext", resource.context),
+                        cast("ClickSolver", resource.solver),
                     )
                     return
             finally:

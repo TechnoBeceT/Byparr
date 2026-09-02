@@ -262,7 +262,7 @@ async def _navigate_and_solve(
         await _wait_for_networkidle(dep, timer)
         return False, page_html, page_request
 
-    await solve_challenge(dep.page, timer)
+    await solve_challenge(dep.page, dep.solver, timer)
     await _wait_for_networkidle(dep, timer)
     return True, page_html, page_request
 

@@ -94,7 +94,7 @@ def fake_dep(*, html: str = ARTICLE_HTML) -> BrowserDepClass:
             raise PlaywrightTimeoutError(message)
 
     page.wait_for_load_state.side_effect = wait_for_load_state
-    return BrowserDepClass(page=page, context=AsyncMock())
+    return BrowserDepClass(page=page, context=AsyncMock(), solver=AsyncMock())
 
 
 @pytest.mark.asyncio

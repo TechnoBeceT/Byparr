@@ -42,6 +42,7 @@ class FakeResource:
         self.name = name
         self.page = f"page:{name}"
         self.context = f"context:{name}"
+        self.solver = f"solver:{name}"
         self.close_error = close_error
         self.close_calls = 0
         self.closed = asyncio.Event()

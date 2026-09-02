@@ -41,7 +41,7 @@ class ProxySettings:
         return f"proxy:{digest}"
 
     def as_playwright_proxy(self) -> dict[str, str | None] | None:
-        """Return the proxy format accepted by InvisiblePlaywright."""
+        """Return the proxy format accepted by Camoufox."""
         if self.server is None:
             return None
         return {

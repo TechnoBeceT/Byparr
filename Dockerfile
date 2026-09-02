@@ -1,5 +1,5 @@
 # Ubuntu is required by playwright.
-# Pin to 24.04 LTS: ubuntu:latest floats to 26.04, which Playwright 1.58
+# Pin to 24.04 LTS: ubuntu:latest floats to 26.04, which Playwright 1.60
 # cannot install firefox deps for (no libgtk-3 -> camoufox fails to launch).
 FROM ubuntu:24.04 AS base
 
@@ -24,7 +24,7 @@ FROM base AS devcontainer
 RUN apt-get update &&\
     apt-get install -y --no-install-recommends git &&\
     uvx playwright install-deps firefox &&\
-    uvx --from git+https://github.com/feder-cr/invisible_playwright.git python -m invisible_playwright fetch &&\
+    uvx camoufox fetch &&\
     apt-get clean &&\
     rm -rf /var/lib/apt/lists/*
 ENTRYPOINT [ "sleep", "infinity" ]
@@ -35,7 +35,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN mkdir -p /cache &&\
     uv sync &&\
-    uv run python -m invisible_playwright fetch &&\
+    uv run camoufox fetch &&\
     apt-get update &&\
     uv run playwright install-deps firefox &&\
     uv cache clean &&\
@@ -46,7 +46,8 @@ COPY . .
 
 RUN mkdir -p /home/byparr &&\
     chmod -R o+rX /app &&\
-    chmod -R a+rwX /cache /home/byparr
+    chmod -R a+rwX /cache /home/byparr &&\
+    find /app/.venv -path "*/camoufox_add_init_script/addon" -type d -exec chmod -R o+rwX {} +
 
 FROM app AS test
 RUN \

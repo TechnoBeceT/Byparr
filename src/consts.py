@@ -1,5 +1,10 @@
 import logging
+import sys
+from pathlib import Path
 
+from playwright_captcha.utils.camoufox_add_init_script.add_init_script import (
+    get_addon_path,
+)
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -46,3 +51,6 @@ BROWSER_LOCALE = settings.browser_locale
 SESSION_TTL_SECONDS = settings.session_ttl_seconds
 SESSION_MAX_SESSIONS = settings.session_max_sessions
 SESSION_LIFECYCLE_TIMEOUT_SECONDS = settings.session_lifecycle_timeout_seconds
+
+ADDON_PATH = str(Path(get_addon_path()).absolute())
+MAX_ATTEMPTS = sys.maxsize

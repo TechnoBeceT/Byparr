@@ -106,7 +106,7 @@ async def get_browser(
     )
     resource = await BrowserFactory().open(proxy)
     try:
-        yield BrowserDepClass(resource.page, resource.context)
+        yield BrowserDepClass(resource.page, resource.context, resource.solver)
     finally:
         await resource.close()
 
@@ -133,7 +133,7 @@ async def get_request_browser(
     if key is None:
         resource = await BrowserFactory().open(proxy)
         try:
-            yield BrowserDepClass(resource.page, resource.context)
+            yield BrowserDepClass(resource.page, resource.context, resource.solver)
         finally:
             await resource.close()
         return

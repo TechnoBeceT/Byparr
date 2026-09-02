@@ -93,6 +93,23 @@ class FakePlaywrightScope:
             raise self.exit_error
 
 
+class FakeSolver:
+    async def solve_captcha(self, **_kwargs: object) -> None:
+        return None
+
+
+class FakeSolverScope:
+    def __init__(self) -> None:
+        self.solver = FakeSolver()
+        self.exit_calls = 0
+
+    async def __aenter__(self) -> FakeSolver:
+        return self.solver
+
+    async def __aexit__(self, *args: object) -> None:
+        self.exit_calls += 1
+
+
 class FakeBrowserFactory:
     def __init__(self, resource: ManagedBrowserResource) -> None:
         self.resource = resource
@@ -107,21 +124,68 @@ class FakeResource:
     def __init__(self) -> None:
         self.page = FakePage()
         self.context = FakeContext()
+        self.solver = FakeSolver()
         self.close_calls = 0
 
     async def close(self) -> None:
         self.close_calls += 1
 
 
-def make_factory(scope: FakePlaywrightScope) -> BrowserFactory:
-    def build_scope(**_: object) -> FakePlaywrightScope:
+def make_factory(
+    scope: FakePlaywrightScope,
+    solver_scope: FakeSolverScope | None = None,
+    browser_options: dict[str, object] | None = None,
+    solver_options: dict[str, object] | None = None,
+) -> BrowserFactory:
+    def build_scope(**options: object) -> FakePlaywrightScope:
+        if browser_options is not None:
+            browser_options.update(options)
         return scope
+
+    selected_solver_scope = solver_scope or FakeSolverScope()
+
+    def build_solver(**options: object) -> FakeSolverScope:
+        if solver_options is not None:
+            solver_options.update(options)
+        return selected_solver_scope
 
     factory = cast(
         "Callable[..., AbstractAsyncContextManager[Any]]",
         build_scope,
     )
-    return BrowserFactory(playwright_factory=factory)
+    solver_factory = cast(
+        "Callable[..., AbstractAsyncContextManager[Any]]",
+        build_solver,
+    )
+    return BrowserFactory(
+        playwright_factory=factory,
+        solver_factory=solver_factory,
+    )
+
+
+@pytest.mark.asyncio
+async def test_browser_factory_owns_camoufox_solver_for_resource_lifetime() -> None:
+    context = FakeContext()
+    scope = FakePlaywrightScope(FakeBrowser(context=context))
+    solver_scope = FakeSolverScope()
+    browser_options: dict[str, object] = {}
+    solver_options: dict[str, object] = {}
+
+    resource = await make_factory(
+        scope, solver_scope, browser_options, solver_options
+    ).open(ProxySettings.direct())
+
+    assert resource.solver is solver_scope.solver
+    assert browser_options["main_world_eval"] is True
+    assert browser_options["geoip"] is True
+    assert browser_options["disable_coop"] is True
+    assert solver_options["page"] is context.page
+    assert solver_options["attempt_delay"] == 1
+    await resource.close()
+
+    assert solver_scope.exit_calls == 1
+    assert context.close_calls == 1
+    assert scope.exit_calls == 1
 
 
 @pytest.mark.asyncio
@@ -326,7 +390,9 @@ async def test_disposable_browser_dependency_closes_resource_on_every_exit(
     )
     dependency_value = await anext(dependency)
     assert dependency_value == utils.BrowserDepClass(
-        cast("Page", resource.page), cast("BrowserContext", resource.context)
+        cast("Page", resource.page),
+        cast("BrowserContext", resource.context),
+        cast("Any", resource.solver),
     )
 
     if finish == "normal":

@@ -203,7 +203,8 @@ def fake_dep(
 
     context = AsyncMock()
     context.cookies.return_value = []
-    return BrowserDepClass(page=page, context=context)
+    solver = AsyncMock()
+    return BrowserDepClass(page=page, context=context, solver=solver)
 
 
 class EndpointResource:
@@ -212,6 +213,7 @@ class EndpointResource:
     def __init__(self, number: int) -> None:
         self.page = cast("AsyncMock", fake_dep().page)
         self.context = AsyncMock()
+        self.solver = AsyncMock()
         self.context.cookies.return_value = [
             {
                 "name": "browser",
@@ -378,17 +380,13 @@ class ChallengeProbeEndpointFactory(EndpointFactory):
             return resource
         error = self._probe_error()
         marker = self._marker(error)
-        token = self._token(error)
-        widget = self._widget(error)
-        if self.probe == "click":
-            resource.page.mouse.move.side_effect = error
+        if self.probe == "solver":
+            resource.solver.solve_captcha.side_effect = error
 
         def locator(selector: str) -> MagicMock:
             if selector in CF_INTERSTITIAL_INDICATORS_SELECTORS:
                 return marker
-            if selector == 'input[name="cf-turnstile-response"]':
-                return token
-            return widget
+            return MagicMock()
 
         resource.page.locator.side_effect = locator
         return resource
@@ -414,25 +412,6 @@ class ChallengeProbeEndpointFactory(EndpointFactory):
 
         marker.count = AsyncMock(side_effect=marker_count)
         return marker
-
-    def _token(self, error: PlaywrightError) -> MagicMock:
-        token = MagicMock()
-        token.count = AsyncMock(return_value=0)
-        token.first.input_value = AsyncMock(return_value="")
-        if self.probe == "token":
-            token.count.side_effect = error
-        return token
-
-    def _widget(self, error: PlaywrightError) -> MagicMock:
-        widget = MagicMock()
-        widget.count = AsyncMock(return_value=1)
-        widget.first.bounding_box = AsyncMock(
-            return_value={"x": 1.0, "y": 2.0, "width": 100.0, "height": 50.0}
-        )
-        if self.probe == "widget":
-            widget.count.side_effect = error
-        return widget
-
 
 class RejectingSessionManager:
     """Model a saturated retained-session manager at the HTTP boundary."""
@@ -1064,7 +1043,7 @@ async def test_playwright_failure_log_uses_safe_site_and_error_class(
         assert secret not in rendered
 
 
-@pytest.mark.parametrize("fatal_probe", ["marker", "token", "widget", "click"])
+@pytest.mark.parametrize("fatal_probe", ["marker", "solver"])
 @pytest.mark.asyncio
 async def test_fatal_challenge_probe_retires_the_retained_resource(
     fatal_probe: str,
@@ -1077,7 +1056,7 @@ async def test_fatal_challenge_probe_retires_the_retained_resource(
     payload = {
         "url": "https://example.test/challenge",
         "session": "account",
-        "maxTimeout": 0,
+        "maxTimeout": 2,
     }
 
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -1097,7 +1076,7 @@ async def test_fatal_challenge_probe_retires_the_retained_resource(
 async def test_ordinary_challenge_probe_error_preserves_the_retained_resource() -> None:
     """A nonfatal probe failure retains the browser for the next request."""
     factory = ChallengeProbeEndpointFactory(
-        "token", fatal=False, clear_after_marker_calls=3
+        "solver", fatal=False, clear_after_marker_calls=2
     )
     manager = SessionManager(factory)
     app.state.session_manager = manager
@@ -1105,7 +1084,7 @@ async def test_ordinary_challenge_probe_error_preserves_the_retained_resource() 
     payload = {
         "url": "https://example.test/challenge",
         "session": "account",
-        "maxTimeout": 0,
+        "maxTimeout": 2,
     }
 
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -1114,7 +1093,7 @@ async def test_ordinary_challenge_probe_error_preserves_the_retained_resource() 
     await manager.close()
 
     assert [first.status_code, second.status_code] == [
-        HTTPStatus.REQUEST_TIMEOUT,
+        HTTPStatus.BAD_GATEWAY,
         HTTPStatus.OK,
     ]
     assert len(factory.resources) == 1
@@ -1438,12 +1417,11 @@ async def test_missing_user_agent_header_is_not_a_500():
 
 
 @pytest.mark.asyncio
-async def test_checkbox_is_clicked_while_the_challenge_is_up():
-    """A measurable widget gets a humanised press, not a raw synthetic click."""
+async def test_detected_challenge_uses_the_camoufox_click_solver():
+    """The compatible solver owns the challenge interaction strategy."""
     dep = fake_dep(
         challenged=True,
-        marker_counts=[1, 1, 0],
-        widget_box={"x": 100.0, "y": 200.0, "width": 300.0, "height": 60.0},
+        marker_counts=[1, 0, 0],
     )
 
     response = await read_item(
@@ -1451,9 +1429,7 @@ async def test_checkbox_is_clicked_while_the_challenge_is_up():
     )
 
     assert response.status == "ok"
-    dep.page.mouse.move.assert_awaited_once_with(125.0, 230.0)
-    dep.page.mouse.down.assert_awaited_once()
-    dep.page.mouse.up.assert_awaited_once()
+    dep.solver.solve_captcha.assert_awaited_once()
 
 
 @pytest.mark.asyncio
