@@ -11,7 +11,7 @@ from typing import Any, NamedTuple, Protocol, cast
 from camoufox import AsyncCamoufox
 from playwright._impl._errors import is_target_closed_error
 from playwright.async_api import Browser, BrowserContext, Page
-from playwright_captcha import ClickSolver, FrameworkType
+from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 
 from src.consts import ADDON_PATH, BROWSER_LOCALE, MAX_ATTEMPTS
 from src.proxy import ProxySettings
@@ -19,6 +19,10 @@ from src.proxy import ProxySettings
 
 class BrowserResourceUnusableError(RuntimeError):
     """Signal that request-local browser state could not be restored safely."""
+
+
+class FatalSolverBrowserError(BaseException):
+    """Carry fatal browser closure through a dependency's Exception retry loop."""
 
 
 def is_fatal_browser_error(error: BaseException) -> bool:
@@ -33,6 +37,25 @@ def is_fatal_browser_error(error: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+class ManagedClickSolver(ClickSolver):
+    """Preserve ordinary retries while surfacing fatal browser closure promptly."""
+
+    async def _solve_captcha_once(
+        self,
+        captcha_container: object,
+        captcha_type: CaptchaType,
+        **kwargs: object,
+    ) -> None:
+        try:
+            await super()._solve_captcha_once(
+                captcha_container, captcha_type, **kwargs
+            )
+        except Exception as error:
+            if is_fatal_browser_error(error):
+                raise FatalSolverBrowserError from error
+            raise
 
 
 class BrowserDepClass(NamedTuple):
@@ -123,7 +146,7 @@ class BrowserFactory:
         ] = AsyncCamoufox,
         solver_factory: Callable[
             ..., AbstractAsyncContextManager[Any]
-        ] = ClickSolver,
+        ] = ManagedClickSolver,
     ) -> None:
         """Configure the Camoufox and challenge-solver constructors."""
         self._playwright_factory = playwright_factory

@@ -13,7 +13,7 @@ from playwright.async_api import Page, Route
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from src.browser import BrowserResourceUnusableError, is_fatal_browser_error
-from src.challenge import challenge_present, solve_challenge
+from src.challenge import ChallengeSolverError, challenge_present, solve_challenge
 from src.content import build_response_content
 from src.models import (
     HealthcheckResponse,
@@ -84,12 +84,22 @@ async def read_item(request: LinkRequest, dep: BrowserDepClass) -> LinkResponse:
                 detail="Timed out while loading the page or solving the challenge",
             ) from error
         except PlaywrightError as error:
+            if is_fatal_browser_error(error):
+                raise
             log_browser_error(
                 "browser_request_error", request.url, error, outcome="failure"
             )
             raise HTTPException(
                 status_code=502,
                 detail=f"Could not reach the target ({type(error).__name__})",
+            ) from error
+        except ChallengeSolverError as error:
+            log_browser_error(
+                "browser_request_error", request.url, error, outcome="solver_failure"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="The challenge solver could not complete",
             ) from error
 
         cookies = await dep.context.cookies()

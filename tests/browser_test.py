@@ -1,4 +1,4 @@
-# ruff: noqa: D102, D103, D105, D107, S106
+# ruff: noqa: D102, D103, D105, D107, S106, SLF001
 
 from __future__ import annotations
 
@@ -7,12 +7,21 @@ import gc
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractAsyncContextManager
 from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright._impl._errors import TargetClosedError
 from playwright.async_api import BrowserContext, Page
+from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 
 from src import utils
-from src.browser import BrowserFactory, ManagedBrowserResource
+from src.browser import (
+    BrowserFactory,
+    FatalSolverBrowserError,
+    ManagedBrowserResource,
+    ManagedClickSolver,
+)
+from src.consts import MAX_ATTEMPTS
 from src.proxy import ProxySettings
 
 
@@ -181,11 +190,64 @@ async def test_browser_factory_owns_camoufox_solver_for_resource_lifetime() -> N
     assert browser_options["disable_coop"] is True
     assert solver_options["page"] is context.page
     assert solver_options["attempt_delay"] == 1
+    assert solver_options["max_attempts"] == MAX_ATTEMPTS
     await resource.close()
 
     assert solver_scope.exit_calls == 1
     assert context.close_calls == 1
     assert scope.exit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_click_solver_escapes_dependency_retry_on_target_closure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fatal closure crosses the real dependency loop without a second attempt."""
+    solve_once = AsyncMock(side_effect=TargetClosedError("closed"))
+    monkeypatch.setattr(ClickSolver, "_solve_captcha_once", solve_once)
+    solver = ManagedClickSolver(
+        framework=FrameworkType.CAMOUFOX,
+        page=MagicMock(),
+        max_attempts=MAX_ATTEMPTS,
+        attempt_delay=0,
+    )
+    solver._prepare_called = True
+    solver._get_solver_data = AsyncMock(return_value={})
+
+    with pytest.raises(FatalSolverBrowserError) as exc:
+        await solver.solve_captcha(
+            captcha_container=MagicMock(),
+            captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL,
+        )
+
+    assert not isinstance(exc.value, Exception)
+    assert isinstance(exc.value.__cause__, TargetClosedError)
+    solve_once.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_managed_click_solver_preserves_dependency_retry_for_nonfatal_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only fatal closure bypasses ClickSolver's established retry policy."""
+    solve_once = AsyncMock(side_effect=[RuntimeError("retry"), None])
+    expected_attempts = 2
+    monkeypatch.setattr(ClickSolver, "_solve_captcha_once", solve_once)
+    solver = ManagedClickSolver(
+        framework=FrameworkType.CAMOUFOX,
+        page=MagicMock(),
+        max_attempts=expected_attempts,
+        attempt_delay=0,
+    )
+    solver._prepare_called = True
+    solver._get_solver_data = AsyncMock(return_value={})
+
+    await solver.solve_captcha(
+        captcha_container=MagicMock(),
+        captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL,
+    )
+
+    assert solve_once.await_count == expected_attempts
 
 
 @pytest.mark.asyncio

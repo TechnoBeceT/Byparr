@@ -21,6 +21,10 @@ __all__ = [
 POLL_INTERVAL = 0.25
 
 
+class ChallengeSolverError(RuntimeError):
+    """A bounded, nonfatal failure reported by the challenge dependency."""
+
+
 async def challenge_present(page: Page) -> bool:
     """Report whether the Cloudflare interstitial is up."""
     for selector in CF_INTERSTITIAL_INDICATORS_SELECTORS:
@@ -47,15 +51,22 @@ async def challenge_is_gone(page: Page) -> bool:
 async def solve_challenge(page: Page, solver: ClickSolver, timer: TimeoutTimer) -> None:
     """Delegate challenge interaction to the Camoufox-aware click solver."""
     logger.info("Challenge detected, attempting to solve...")
-    await asyncio.wait_for(
-        solver.solve_captcha(
-            captcha_container=page,
-            captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL,
-            wait_checkbox_attempts=1,
-            wait_checkbox_delay=0.5,
-        ),
-        timeout=timer.remaining(),
-    )
+    try:
+        await asyncio.wait_for(
+            solver.solve_captcha(
+                captcha_container=page,
+                captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL,
+                wait_checkbox_attempts=1,
+                wait_checkbox_delay=0.5,
+            ),
+            timeout=timer.remaining(),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        if is_fatal_browser_error(error):
+            raise
+        raise ChallengeSolverError from error
     if not await challenge_is_gone(page):
         message = "Challenge still present after the solver returned"
         raise TimeoutError(message)

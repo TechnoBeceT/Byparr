@@ -49,6 +49,20 @@ requests and `v*` tag pushes build and test; manual dispatch builds, tests,
 and publishes. Ordinary branch pushes do not trigger this workflow, and neither
 branch pushes nor pull requests publish an image.
 
+## Browser architecture
+
+Each browser resource combines an `AsyncCamoufox` browser context with a
+page-bound `ClickSolver`. `BrowserFactory` opens and closes both components as
+one lifecycle. Disposable requests close that resource when the response is
+complete; named requests place it under `SessionManager`, which serializes use
+per isolation key, applies idle and capacity limits, and retires the resource
+when its page, context, or browser closes unexpectedly.
+
+Challenge detection and solving are separate checks. Byparr uses the
+dependency's Cloudflare marker selectors to detect an interstitial, delegates
+the browser interaction to `ClickSolver`, and then verifies that the marker is
+still absent before reporting success.
+
 ## Usage
 
 > [!IMPORTANT]

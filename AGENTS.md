@@ -2,14 +2,15 @@
 
 ## Project overview
 
-- FastAPI service that mimics FlareSolverr-style API for bypassing anti-bot pages using invisible_playwright.
+- FastAPI service that mimics the FlareSolverr-style API for bypassing anti-bot pages using Camoufox.
 - Entry point: main app in main.py; routes and request flow in src/endpoints.py, challenge handling in src/challenge.py, response bodies in src/content.py, models in src/models.py.
-- Browser lifecycle is owned by get_browser() in src/utils.py, which yields a page and context for each request.
+- SessionManager owns retained browser lifecycles; disposable requests use the same BrowserFactory resource boundary without retention.
 
 ## Architecture and data flow
 
-- Request flow: POST /v1 -> read_item() -> page.goto() -> wait for load states -> detect the interstitial -> click its checkbox until it clears -> return LinkResponse.
-- Challenge detection uses detect_cloudflare_challenge() from playwright_captcha; the challenge is over when its markup goes, not when a solver says so.
+- Request flow: POST /v1 -> SessionManager/disposable acquisition -> read_item() -> page.goto() -> detect the interstitial -> ClickSolver interaction -> verify its markup is gone -> return LinkResponse.
+- BrowserFactory opens AsyncCamoufox and a page-bound ClickSolver as one resource. SessionManager exclusively owns retained resources, serializes use per isolation key, and evicts resources after fatal browser closure.
+- Challenge detection uses playwright_captcha's Cloudflare indicator selectors; the challenge is complete only when its markup remains absent after a settling probe.
 - Health check hits /v1 internally with <https://google.com> and fails if status is not OK.
 - Logging: LogRequest middleware logs only POST /v1 timing and outcome; other paths pass through.
 
@@ -17,7 +18,7 @@
 
 - Models use Pydantic v2 with camelCase aliasing for responses (see src/models.py).
 - LinkResponse.invalid() is the standard error response shape; keep fields consistent with FlareSolverr style.
-- get_camoufox() constructs AsyncCamoufox with addons and optional proxy config from env vars.
+- BrowserFactory constructs AsyncCamoufox with the required addon and resolved proxy settings, and enters ClickSolver for the same resource lifetime.
 
 ## Config and environment
 

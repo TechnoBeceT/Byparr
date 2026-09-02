@@ -26,11 +26,11 @@ SESSION_LIFESPAN_REQUIRED_MESSAGE = (
 
 solver_logger = logging.getLogger("playwright_captcha")
 solver_logger.handlers.clear()
-if LOG_LEVEL == logging.DEBUG:
-    solver_logger.addHandler(logging.StreamHandler())
-    solver_logger.setLevel(LOG_LEVEL)
-else:
-    solver_logger.handlers.append(logging.NullHandler())
+solver_log_sink = logging.NullHandler()
+solver_logger.addHandler(solver_log_sink)
+solver_logger.propagate = False
+solver_logger.disabled = True
+solver_logger.setLevel(logging.CRITICAL + 1)
 
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(LOG_LEVEL)

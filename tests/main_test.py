@@ -413,6 +413,7 @@ class ChallengeProbeEndpointFactory(EndpointFactory):
         marker.count = AsyncMock(side_effect=marker_count)
         return marker
 
+
 class RejectingSessionManager:
     """Model a saturated retained-session manager at the HTTP boundary."""
 
@@ -1430,6 +1431,52 @@ async def test_detected_challenge_uses_the_camoufox_click_solver():
 
     assert response.status == "ok"
     dep.solver.solve_captcha.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "solver_error",
+    [RuntimeError("not prepared"), ValueError("unsupported"), TypeError("bad type")],
+)
+@pytest.mark.asyncio
+async def test_bounded_solver_failures_return_a_redacted_502(
+    solver_error: Exception,
+) -> None:
+    """Dependency failures are gateway failures, never accidental application errors."""
+    dep = fake_dep(challenged=True, marker_counts=[1])
+    dep.solver.solve_captcha.side_effect = solver_error
+
+    with pytest.raises(HTTPException) as exc:
+        await read_item(
+            LinkRequest(url="https://example.test/login", max_timeout=5), dep
+        )
+
+    assert exc.value.status_code == HTTPStatus.BAD_GATEWAY
+    assert exc.value.detail == "The challenge solver could not complete"
+    assert str(solver_error) not in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_solver_target_closure_remains_fatal_for_session_invalidation() -> None:
+    """A closed browser escapes solver mapping so retained sessions can evict it."""
+    dep = fake_dep(challenged=True, marker_counts=[1])
+    dep.solver.solve_captcha.side_effect = TargetClosedError("private browser detail")
+
+    with pytest.raises(TargetClosedError):
+        await read_item(
+            LinkRequest(url="https://example.test/login", max_timeout=5), dep
+        )
+
+
+@pytest.mark.asyncio
+async def test_solver_cancellation_is_not_mapped_to_a_gateway_failure() -> None:
+    """Task cancellation must retain asyncio's cooperative cancellation contract."""
+    dep = fake_dep(challenged=True, marker_counts=[1])
+    dep.solver.solve_captcha.side_effect = asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await read_item(
+            LinkRequest(url="https://example.test/login", max_timeout=5), dep
+        )
 
 
 @pytest.mark.asyncio
