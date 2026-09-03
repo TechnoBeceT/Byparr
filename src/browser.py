@@ -16,6 +16,8 @@ from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 from src.consts import ADDON_PATH, BROWSER_LOCALE, MAX_ATTEMPTS
 from src.proxy import ProxySettings
 
+_PROXY_UNSUPPORTED_ERROR = "Proxy browser launches are unsupported"
+
 
 class BrowserResourceUnusableError(RuntimeError):
     """Signal that request-local browser state could not be restored safely."""
@@ -152,12 +154,13 @@ class BrowserFactory:
 
     async def open(self, proxy: ProxySettings) -> BrowserResource:
         """Enter a browser scope and create a context and page within it."""
-        fingerprint_ip = proxy.fingerprint_ip
+        if proxy.server is not None:
+            raise RuntimeError(_PROXY_UNSUPPORTED_ERROR)
         scope = self._playwright_factory(
             main_world_eval=True,
             addons=[ADDON_PATH],
             exclude_addons=[DefaultAddons.UBO],
-            geoip=str(fingerprint_ip) if fingerprint_ip is not None else False,
+            geoip=False,
             headless=True,
             proxy=proxy.as_playwright_proxy(),
             humanize=True,
