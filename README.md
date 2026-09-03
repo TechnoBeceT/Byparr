@@ -58,11 +58,16 @@ complete; named requests place it under `SessionManager`, which serializes use
 per isolation key, applies idle and capacity limits, and retires the resource
 when its page, context, or browser closes unexpectedly.
 
-Challenge detection and solving are separate checks. Byparr uses the
-dependency's Cloudflare marker selectors to detect an interstitial, delegates
-the browser interaction to `ClickSolver`, and treats its successful return as
-authoritative. Bootstrap challenge markup can remain in the resulting page even
-after Cloudflare accepts the browser.
+Challenge detection and solving are separate checks. Byparr requires both a
+dependency-provided Cloudflare marker and the standard interstitial page title,
+then delegates the browser interaction to `ClickSolver` and treats its
+successful return as authoritative. Bootstrap challenge markup can remain in
+the resulting page even after Cloudflare accepts the browser.
+
+Challenge-free pages return after their DOM content is captured. They do not
+wait for global network idle, because persistent background requests are not
+part of the response contract. A solved interstitial still receives the
+post-solver network-idle wait before its response is collected.
 
 ## Usage
 

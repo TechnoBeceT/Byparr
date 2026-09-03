@@ -164,6 +164,7 @@ def fake_dep(
     challenged: bool = False,
     marker_counts: list[int] | None = None,
     widget_box: dict[str, float] | None = None,
+    title: str = "Login",
     user_agent: str | None = "UnitTestBrowser/1.0",
 ) -> BrowserDepClass:
     """Build a browser dependency pair backed by mocks."""
@@ -174,7 +175,7 @@ def fake_dep(
         headers={"content-type": "text/html"},
         request=MagicMock(headers={"user-agent": user_agent} if user_agent else {}),
     )
-    page.title.return_value = "Login"
+    page.title.return_value = title
     page.content.return_value = "<html><title>Login</title></html>"
     remaining = list(marker_counts or [])
 
@@ -381,6 +382,7 @@ class ChallengeProbeEndpointFactory(EndpointFactory):
         error = self._probe_error()
         marker = self._marker(error)
         if self.probe == "solver":
+            resource.page.title.return_value = "Just a moment..."
             resource.solver.solve_captcha.side_effect = error
 
         def locator(selector: str) -> MagicMock:
@@ -1346,9 +1348,10 @@ async def test_lifespan_cancels_expiry_before_closing_the_session_manager(
 
 
 @pytest.mark.asyncio
-async def test_networkidle_timeout_after_domcontentloaded_returns_content():
-    """Pages that never go idle after DOM load must still return their content."""
-    dep = fake_dep(fail_states={"networkidle"})
+async def test_loaded_page_returns_content_and_cookies_without_waiting_for_networkidle():
+    """A challenge-free page is complete once its DOM content is captured."""
+    dep = fake_dep()
+    dep.context.cookies.return_value = [{"name": "session", "value": "warm"}]
     response = await read_item(
         LinkRequest(url="https://example.test/login"),
         dep,
@@ -1356,6 +1359,50 @@ async def test_networkidle_timeout_after_domcontentloaded_returns_content():
 
     assert response.status == "ok"
     assert response.solution.response == "<html><title>Login</title></html>"
+    assert response.solution.cookies[0]["name"] == "session"
+    assert [
+        call.kwargs.get("state", call.args[0] if call.args else None)
+        for call in dep.page.wait_for_load_state.await_args_list
+    ] == ["domcontentloaded"]
+
+
+@pytest.mark.asyncio
+async def test_solved_challenge_still_waits_for_networkidle_before_response():
+    """Challenge navigation retains its post-solver settling contract."""
+    dep = fake_dep(challenged=True, marker_counts=[1], title="Just a moment...")
+
+    response = await read_item(
+        LinkRequest(url="https://example.test/login", max_timeout=5), dep
+    )
+
+    assert response.status == "ok"
+    assert [
+        call.kwargs.get("state", call.args[0] if call.args else None)
+        for call in dep.page.wait_for_load_state.await_args_list
+    ] == ["domcontentloaded", "networkidle"]
+
+
+@pytest.mark.parametrize(
+    "settle_error",
+    [asyncio.CancelledError(), TargetClosedError("browser has been closed")],
+)
+@pytest.mark.asyncio
+async def test_challenge_settle_preserves_lifecycle_failures(
+    settle_error: BaseException,
+) -> None:
+    """Cancellation and browser closure during challenge settling remain fatal."""
+    dep = fake_dep(challenged=True, marker_counts=[1], title="Just a moment...")
+
+    async def wait_for_load_state(state: str, **_kwargs: object) -> None:
+        if state == "networkidle":
+            raise settle_error
+
+    dep.page.wait_for_load_state.side_effect = wait_for_load_state
+
+    with pytest.raises(type(settle_error)):
+        await read_item(
+            LinkRequest(url="https://example.test/login", max_timeout=5), dep
+        )
 
 
 @pytest.mark.asyncio
@@ -1423,6 +1470,7 @@ async def test_detected_challenge_uses_the_camoufox_click_solver():
     dep = fake_dep(
         challenged=True,
         marker_counts=[1, 0, 0],
+        title="Just a moment...",
     )
 
     response = await read_item(
@@ -1431,6 +1479,19 @@ async def test_detected_challenge_uses_the_camoufox_click_solver():
 
     assert response.status == "ok"
     dep.solver.solve_captcha.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_marker_on_loaded_site_does_not_invoke_solver_without_cf_title():
+    """A bootstrap script left on a solved page is not an active interstitial."""
+    dep = fake_dep(challenged=True, marker_counts=[1], title="The Blank")
+
+    response = await read_item(
+        LinkRequest(url="https://example.test/login", max_timeout=5), dep
+    )
+
+    assert response.status == "ok"
+    dep.solver.solve_captcha.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1442,7 +1503,7 @@ async def test_bounded_solver_failures_return_a_redacted_502(
     solver_error: Exception,
 ) -> None:
     """Dependency failures are gateway failures, never accidental application errors."""
-    dep = fake_dep(challenged=True, marker_counts=[1])
+    dep = fake_dep(challenged=True, marker_counts=[1], title="Just a moment...")
     dep.solver.solve_captcha.side_effect = solver_error
 
     with pytest.raises(HTTPException) as exc:
@@ -1458,7 +1519,7 @@ async def test_bounded_solver_failures_return_a_redacted_502(
 @pytest.mark.asyncio
 async def test_solver_target_closure_remains_fatal_for_session_invalidation() -> None:
     """A closed browser escapes solver mapping so retained sessions can evict it."""
-    dep = fake_dep(challenged=True, marker_counts=[1])
+    dep = fake_dep(challenged=True, marker_counts=[1], title="Just a moment...")
     dep.solver.solve_captcha.side_effect = TargetClosedError("private browser detail")
 
     with pytest.raises(TargetClosedError):
@@ -1470,7 +1531,7 @@ async def test_solver_target_closure_remains_fatal_for_session_invalidation() ->
 @pytest.mark.asyncio
 async def test_solver_cancellation_is_not_mapped_to_a_gateway_failure() -> None:
     """Task cancellation must retain asyncio's cooperative cancellation contract."""
-    dep = fake_dep(challenged=True, marker_counts=[1])
+    dep = fake_dep(challenged=True, marker_counts=[1], title="Just a moment...")
     dep.solver.solve_captcha.side_effect = asyncio.CancelledError
 
     with pytest.raises(asyncio.CancelledError):
@@ -1485,6 +1546,7 @@ async def test_challenge_that_clears_on_its_own_is_never_clicked():
     dep = fake_dep(
         challenged=True,
         marker_counts=[1, 0],
+        title="Just a moment...",
         widget_box={"x": 100.0, "y": 200.0, "width": 300.0, "height": 60.0},
     )
 
@@ -1499,7 +1561,7 @@ async def test_challenge_that_clears_on_its_own_is_never_clicked():
 @pytest.mark.asyncio
 async def test_solver_return_is_authoritative_when_marker_remains():
     """A stale challenge marker cannot overturn the solver's success contract."""
-    dep = fake_dep(challenged=True, marker_counts=[1])
+    dep = fake_dep(challenged=True, marker_counts=[1], title="Just a moment...")
 
     response = await read_item(
         LinkRequest(url="https://example.test/login", max_timeout=2), dep
@@ -1512,7 +1574,11 @@ async def test_solver_return_is_authoritative_when_marker_remains():
 @pytest.mark.asyncio
 async def test_solver_return_is_authoritative_when_marker_state_is_transient():
     """Post-solve marker transitions belong to the solver, not the endpoint."""
-    dep = fake_dep(challenged=True, marker_counts=[1, 0, 1])
+    dep = fake_dep(
+        challenged=True,
+        marker_counts=[1, 0, 1],
+        title="Just a moment...",
+    )
 
     response = await read_item(
         LinkRequest(url="https://example.test/login", max_timeout=2), dep

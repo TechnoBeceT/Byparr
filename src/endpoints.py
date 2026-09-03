@@ -269,7 +269,6 @@ async def _navigate_and_solve(
 
     if not await challenge_present(dep.page):
         page_html = await dep.page.content()
-        await _wait_for_networkidle(dep, timer)
         return False, page_html, page_request
 
     await solve_challenge(dep.page, dep.solver, timer)

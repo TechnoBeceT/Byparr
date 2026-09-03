@@ -13,9 +13,12 @@ from src.utils import TimeoutTimer, logger
 
 __all__ = [
     "CF_INTERSTITIAL_INDICATORS_SELECTORS",
+    "CF_INTERSTITIAL_TITLE",
     "challenge_present",
     "solve_challenge",
 ]
+
+CF_INTERSTITIAL_TITLE = "Just a moment..."
 
 
 class ChallengeSolverError(RuntimeError):
@@ -23,7 +26,7 @@ class ChallengeSolverError(RuntimeError):
 
 
 async def challenge_present(page: Page) -> bool:
-    """Report whether the Cloudflare interstitial is up."""
+    """Report whether both Cloudflare interstitial signals are present."""
     for selector in CF_INTERSTITIAL_INDICATORS_SELECTORS:
         try:
             if await page.locator(selector).count() == 0:
@@ -33,7 +36,13 @@ async def challenge_present(page: Page) -> bool:
                 raise
             if "Execution context was destroyed" in str(error):
                 return False
-        return True
+        try:
+            title = await page.title()
+        except (PlaywrightError, PlaywrightTimeoutError) as error:
+            if is_fatal_browser_error(error):
+                raise
+            return False
+        return title.strip().casefold() == CF_INTERSTITIAL_TITLE.casefold()
     return False
 
 
