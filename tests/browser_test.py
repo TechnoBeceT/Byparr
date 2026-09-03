@@ -10,6 +10,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from camoufox import DefaultAddons
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import BrowserContext, Page
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
@@ -188,6 +189,7 @@ async def test_browser_factory_owns_camoufox_solver_for_resource_lifetime() -> N
     assert browser_options["main_world_eval"] is True
     assert browser_options["geoip"] is True
     assert browser_options["disable_coop"] is True
+    assert browser_options["exclude_addons"] == [DefaultAddons.UBO]
     assert solver_options["page"] is context.page
     assert solver_options["attempt_delay"] == 1
     assert solver_options["max_attempts"] == MAX_ATTEMPTS

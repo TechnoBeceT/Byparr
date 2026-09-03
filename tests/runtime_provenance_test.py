@@ -38,12 +38,16 @@ def test_docker_build_supplies_a_verified_read_only_geoip_database() -> None:
 
 
 def test_shipped_environment_launches_geoip_browser_as_uid_1000() -> None:
-    """The test image exercises GeoIP browser launch under its runtime UID."""
+    """The test image exercises an offline browser launch under its runtime UID."""
     dockerfile = (PROJECT_ROOT / "Dockerfile").read_text()
 
     test_stage = dockerfile.split("FROM app AS test", 1)[1].split("FROM app", 1)[0]
     assert "USER 1000" in test_stage
     assert "python -m scripts.verify_runtime_launch" in test_stage
+    assert (
+        "RUN --network=none /app/.venv/bin/python -m scripts.verify_runtime_launch"
+        in test_stage
+    )
 
 
 @pytest.mark.parametrize(

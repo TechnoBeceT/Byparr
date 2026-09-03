@@ -70,7 +70,7 @@ RUN \
     uv run pytest -rs --retries 5 &&\
     find /app/.venv -path "*/camoufox_add_init_script/addon" -type d -exec chmod -R o+rwX {} +
 USER 1000
-RUN /app/.venv/bin/python -m scripts.verify_runtime_launch
+RUN --network=none /app/.venv/bin/python -m scripts.verify_runtime_launch
 
 FROM app
 ARG VERSION

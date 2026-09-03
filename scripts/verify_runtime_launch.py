@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import camoufox
 from camoufox.locale import MMDB_FILE
@@ -30,7 +31,8 @@ async def verify_runtime_launch() -> None:
         raise RuntimeError(msg)
 
     database_before = MMDB_FILE.stat()
-    resource = await BrowserFactory().open(ProxySettings.direct())
+    with patch("camoufox.utils.public_ip", return_value="8.8.8.8"):
+        resource = await BrowserFactory().open(ProxySettings.direct())
     try:
         if await resource.page.title() != "":
             msg = "Fresh browser page should be blank"

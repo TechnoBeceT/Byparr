@@ -8,7 +8,7 @@ from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Protocol, cast
 
-from camoufox import AsyncCamoufox
+from camoufox import AsyncCamoufox, DefaultAddons
 from playwright._impl._errors import is_target_closed_error
 from playwright.async_api import Browser, BrowserContext, Page
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
@@ -155,6 +155,7 @@ class BrowserFactory:
         scope = self._playwright_factory(
             main_world_eval=True,
             addons=[ADDON_PATH],
+            exclude_addons=[DefaultAddons.UBO],
             geoip=True,
             headless=True,
             proxy=proxy.as_playwright_proxy(),
