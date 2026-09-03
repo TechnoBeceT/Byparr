@@ -156,7 +156,7 @@ class BrowserFactory:
             main_world_eval=True,
             addons=[ADDON_PATH],
             exclude_addons=[DefaultAddons.UBO],
-            geoip=True,
+            geoip=False,
             headless=True,
             proxy=proxy.as_playwright_proxy(),
             humanize=True,

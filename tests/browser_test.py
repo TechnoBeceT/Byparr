@@ -10,7 +10,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from camoufox import DefaultAddons
+from camoufox import DefaultAddons, launch_options
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import BrowserContext, Page
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
@@ -187,7 +187,7 @@ async def test_browser_factory_owns_camoufox_solver_for_resource_lifetime() -> N
 
     assert resource.solver is solver_scope.solver
     assert browser_options["main_world_eval"] is True
-    assert browser_options["geoip"] is True
+    assert browser_options["geoip"] is False
     assert browser_options["disable_coop"] is True
     assert browser_options["exclude_addons"] == [DefaultAddons.UBO]
     assert solver_options["page"] is context.page
@@ -198,6 +198,28 @@ async def test_browser_factory_owns_camoufox_solver_for_resource_lifetime() -> N
     assert solver_scope.exit_calls == 1
     assert context.close_calls == 1
     assert scope.exit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_factory_launch_avoids_public_ip_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production launch options must not invoke Camoufox IP discovery."""
+    context = FakeContext()
+    scope = FakePlaywrightScope(FakeBrowser(context=context))
+    browser_options: dict[str, object] = {}
+    resource = await make_factory(scope, browser_options=browser_options).open(
+        ProxySettings.direct()
+    )
+
+    def reject_public_ip(_proxy: str | None = None) -> str:
+        pytest.fail("Browser launch attempted public IP discovery")
+
+    monkeypatch.setattr("camoufox.utils.public_ip", reject_public_ip)
+    try:
+        launch_options(**browser_options)
+    finally:
+        await resource.close()
 
 
 @pytest.mark.asyncio
