@@ -18,24 +18,29 @@ upstream image or endorsement.
 | -------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `HOST`               | `0.0.0.0` | Host address to bind the server to. Use `0.0.0.0` to bind to all IPv4 interfaces, `::` for all IPv6 interfaces, or `127.0.0.1`/`localhost` for local access only. |
 | `PORT`               | `8191`    | Port to bind the server to.                                                                                                                                       |
-| `PROXY_SERVER`       | None      | Proxy to use in format: `protocol://host:port`.                                                                                                                   |
-| `PROXY_USERNAME`     | None      | Username for proxy authentication.                                                                                                                                |
-| `PROXY_PASSWORD`     | None      | Password for proxy authentication.                                                                                                                                |
+| `PROXY_SERVER`       | None      | Compatibility-only proxy endpoint in the form `protocol://host:port`.                                                                                              |
+| `PROXY_USERNAME`     | None      | Compatibility-only proxy username.                                                                                                                                |
+| `PROXY_PASSWORD`     | None      | Compatibility-only proxy password.                                                                                                                                |
 | `OWUI_API_KEY`       | None      | Bearer token for `/load` endpoint authentication. Must match `EXTERNAL_WEB_LOADER_API_KEY` in Open WebUI.                                                         |
-| `BROWSER_LOCALE`     | None      | Override the browser's language with a [BCP-47](https://www.rfc-editor.org/rfc/bcp/bcp47.txt) tag, e.g. `en-US`, `de-DE`, `fr-FR`. When unset, the locale is derived from the egress country. |
+| `BROWSER_LOCALE`     | `en-US`   | Explicit [BCP-47](https://www.rfc-editor.org/rfc/bcp/bcp47.txt) locale override for direct browser launches.                                                       |
 | `SESSION_TTL_SECONDS` | `900` | Idle lifetime for a retained browser session. Minimum `1`. |
 | `SESSION_MAX_SESSIONS` | `8` | Maximum retained browser sessions. Minimum `1`. |
 | `SESSION_LIFECYCLE_TIMEOUT_SECONDS` | `120` | Deadline in seconds for a retained session's browser lifecycle work (opening, retiring, or waiting for replacement). Minimum `1`. |
 
+#### Proxy compatibility
+
+`PROXY_SERVER`, `PROXY_USERNAME`, and `PROXY_PASSWORD` remain accepted only for
+configuration compatibility. Proxied browser launches are unsupported and fail
+before browser startup.
+
 #### Browser language
 
-Set `BROWSER_LOCALE` to a [BCP-47](https://www.rfc-editor.org/rfc/bcp/bcp47.txt) language tag like `en-US`, `de-DE`, `fr-FR`, `pl-PL`, or `zh-CN` to fix the browser's language and `Accept-Language` header. When unset, Byparr derives the locale from the egress country (e.g. a French proxy → `fr-FR`), keeping the browser language consistent with the exit IP.
+Set `BROWSER_LOCALE` to a [BCP-47](https://www.rfc-editor.org/rfc/bcp/bcp47.txt)
+language tag such as `de-DE`, `fr-FR`, `pl-PL`, or `zh-CN` to override the
+browser's language and `Accept-Language` header. Direct browser launches default
+to `en-US`.
 
 Valid tags are maintained in the [IANA Language Subtag Registry](https://www.iana.org/assignments/language-subtag-registry/language-subtag-registry). For a friendlier list, see [List of ISO 639-1 codes](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes) (language) combined with an [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) region code for the full tag, e.g. `pt-BR`.
-
-## Proxy Recommendation
-
-Recently I've partnered with a _new in town_ proxy service - ProxyBase - to offer affordable proxy services that seems to work seamlessly with Byparr! Using my affiliate code `byparr` (case sensitive!) when signing up will not only get you access to their cost-effective (**$0.69/GB with occasional promotions** _at the time of writing_) proxy network but will also help support the continued development of this project. ProxyBase's proxies can significantly improve your success rate when bypassing anti-bot challenges. [Check out ProxyBase](https://client.proxybase.org/signup?ref=byparr) and enhance your Byparr experience!
 
 ## Tags
 
@@ -141,11 +146,11 @@ The returned navigation envelope remains FlareSolverr-compatible:
 }
 ```
 
-For retained requests, the isolation key is the configured session name, the
-target's registrable domain, and the proxy egress identity. For example,
-`reader.example.com` and `api.example.com` share a named session, while a
-different registrable domain or proxy does not. Only one request may use an
-individual key at once; requests for different keys can proceed concurrently.
+For retained requests, the isolation key is the configured session name and the
+target's registrable domain. For example, `reader.example.com` and
+`api.example.com` share a named session, while a different registrable domain
+does not. Only one request may use an individual key at once; requests for
+different keys can proceed concurrently.
 
 Create is a lazy, idempotent declaration: it validates the name but opens no
 browser until the first matching `request.get`.
@@ -167,8 +172,8 @@ curl -X POST http://localhost:8191/v1 \
 }
 ```
 
-Destroy is also idempotent. It resets every retained domain and proxy entry
-for the exact normalized configured name:
+Destroy is also idempotent. It resets every retained domain entry for the exact
+normalized configured name:
 
 ```bash
 curl -X POST http://localhost:8191/v1 \

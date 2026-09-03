@@ -137,7 +137,7 @@ class BrowserResource:
 
 
 class BrowserFactory:
-    """Open independent Camoufox resources for selected proxies."""
+    """Open direct Camoufox resources and reject proxies before browser startup."""
 
     def __init__(
         self,
