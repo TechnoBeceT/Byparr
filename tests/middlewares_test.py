@@ -20,9 +20,7 @@ from src.utils import logger as production_logger
 @pytest.fixture(autouse=True)
 def override_browser_dependency() -> Generator[None]:
     async def browser_dependency() -> AsyncGenerator[BrowserDepClass]:
-        yield BrowserDepClass(
-            page=AsyncMock(), context=AsyncMock(), solver=AsyncMock()
-        )
+        yield BrowserDepClass(page=AsyncMock(), context=AsyncMock(), solver=AsyncMock())
 
     app.dependency_overrides[get_browser] = browser_dependency
     yield

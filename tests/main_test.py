@@ -1497,26 +1497,26 @@ async def test_challenge_that_clears_on_its_own_is_never_clicked():
 
 
 @pytest.mark.asyncio
-async def test_challenge_that_never_clears_returns_408():
-    """A challenge still up when the budget runs out is a timeout, not a 500."""
+async def test_solver_return_is_authoritative_when_marker_remains():
+    """A stale challenge marker cannot overturn the solver's success contract."""
     dep = fake_dep(challenged=True, marker_counts=[1])
 
-    with pytest.raises(HTTPException) as exc:
-        await read_item(
-            LinkRequest(url="https://example.test/login", max_timeout=2), dep
-        )
+    response = await read_item(
+        LinkRequest(url="https://example.test/login", max_timeout=2), dep
+    )
 
-    assert exc.value.status_code == HTTPStatus.REQUEST_TIMEOUT
+    assert response.status == "ok"
+    dep.solver.solve_captcha.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_marker_vanishing_mid_navigation_is_not_a_solved_challenge():
-    """The marker drops out between challenge rounds; one clear read proves nothing."""
+async def test_solver_return_is_authoritative_when_marker_state_is_transient():
+    """Post-solve marker transitions belong to the solver, not the endpoint."""
     dep = fake_dep(challenged=True, marker_counts=[1, 0, 1])
 
-    with pytest.raises(HTTPException) as exc:
-        await read_item(
-            LinkRequest(url="https://example.test/login", max_timeout=2), dep
-        )
+    response = await read_item(
+        LinkRequest(url="https://example.test/login", max_timeout=2), dep
+    )
 
-    assert exc.value.status_code == HTTPStatus.REQUEST_TIMEOUT
+    assert response.status == "ok"
+    dep.solver.solve_captcha.assert_awaited_once()

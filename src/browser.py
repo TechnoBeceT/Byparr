@@ -49,9 +49,7 @@ class ManagedClickSolver(ClickSolver):
         **kwargs: object,
     ) -> None:
         try:
-            await super()._solve_captcha_once(
-                captcha_container, captcha_type, **kwargs
-            )
+            await super()._solve_captcha_once(captcha_container, captcha_type, **kwargs)
         except Exception as error:
             if is_fatal_browser_error(error):
                 raise FatalSolverBrowserError from error

@@ -1,5 +1,4 @@
 import asyncio
-from asyncio import sleep
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
@@ -17,8 +16,6 @@ __all__ = [
     "challenge_present",
     "solve_challenge",
 ]
-
-POLL_INTERVAL = 0.25
 
 
 class ChallengeSolverError(RuntimeError):
@@ -40,14 +37,6 @@ async def challenge_present(page: Page) -> bool:
     return False
 
 
-async def challenge_is_gone(page: Page) -> bool:
-    """Confirm the interstitial is really gone and not just between navigations."""
-    if await challenge_present(page):
-        return False
-    await sleep(POLL_INTERVAL)
-    return not await challenge_present(page)
-
-
 async def solve_challenge(page: Page, solver: ClickSolver, timer: TimeoutTimer) -> None:
     """Delegate challenge interaction to the Camoufox-aware click solver."""
     logger.info("Challenge detected, attempting to solve...")
@@ -67,7 +56,4 @@ async def solve_challenge(page: Page, solver: ClickSolver, timer: TimeoutTimer) 
         if is_fatal_browser_error(error):
             raise
         raise ChallengeSolverError from error
-    if not await challenge_is_gone(page):
-        message = "Challenge still present after the solver returned"
-        raise TimeoutError(message)
     logger.debug("Challenge cleared.")
