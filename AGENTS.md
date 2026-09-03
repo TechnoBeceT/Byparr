@@ -8,9 +8,9 @@
 
 ## Architecture and data flow
 
-- Request flow: POST /v1 -> SessionManager/disposable acquisition -> read_item() -> page.goto() -> detect the interstitial -> ClickSolver interaction -> verify its markup is gone -> return LinkResponse.
+- Request flow: POST /v1 -> SessionManager/disposable acquisition -> read_item() -> page.goto() -> detect the interstitial -> ClickSolver interaction -> return LinkResponse. A successful solver return is authoritative even when bootstrap marker markup remains.
 - BrowserFactory opens AsyncCamoufox and a page-bound ClickSolver as one resource. SessionManager exclusively owns retained resources, serializes use per isolation key, and evicts resources after fatal browser closure.
-- Challenge detection uses playwright_captcha's Cloudflare indicator selectors; the challenge is complete only when its markup remains absent after a settling probe.
+- Challenge detection uses playwright_captcha's Cloudflare indicator selectors; after detection, successful completion is the ClickSolver return rather than marker disappearance.
 - Health check hits /v1 internally with <https://google.com> and fails if status is not OK.
 - Logging: LogRequest middleware logs only POST /v1 timing and outcome; other paths pass through.
 

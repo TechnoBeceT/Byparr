@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import platform
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -12,7 +13,9 @@ CAMOUFOX_VERSION = {"version": "135.0.1", "release": "beta.24"}
 CAMOUFOX_BINARY_SHA256 = (
     "d3999a025212c4fe8ecce8b799912fdf8bd12ca6a5062c87709056041a20c767"
 )
+PYTHON_VERSION = "3.14.2"
 SOLVER_VERSIONS = {
+    "camoufox": "0.4.11",
     "playwright": "1.58.0",
     "playwright-captcha": "0.1.1",
     "apify-fingerprint-datapoints": "0.10.0",
@@ -36,8 +39,22 @@ def verify_runtime(
     browser_dir: Path = Path("/cache/camoufox"),
     geoip_database: Path | None = None,
     installed_versions: Mapping[str, str] | None = None,
+    python_version: str | None = None,
 ) -> None:
-    """Reject a runtime whose browser, GeoIP data, or solver closure drifted."""
+    """Reject a runtime whose interpreter, browser, or solver closure drifted."""
+    actual_python = python_version or platform.python_version()
+    if actual_python != PYTHON_VERSION:
+        message = f"Unexpected Python runtime version: {actual_python}"
+        raise RuntimeError(message)
+
+    versions = installed_versions or {
+        dependency: importlib.metadata.version(dependency)
+        for dependency in SOLVER_VERSIONS
+    }
+    if dict(versions) != SOLVER_VERSIONS:
+        message = f"Unexpected solver dependency closure: {dict(versions)!r}"
+        raise RuntimeError(message)
+
     version = json.loads((browser_dir / "version.json").read_text())
     if version != CAMOUFOX_VERSION:
         message = f"Unexpected Camoufox version metadata: {version!r}"
@@ -53,14 +70,6 @@ def verify_runtime(
     geoip_sha = sha256_file(geoip_database)
     if geoip_sha != GEOIP_DATABASE_SHA256:
         message = f"Unexpected GeoIP database checksum: {geoip_sha}"
-        raise RuntimeError(message)
-
-    versions = installed_versions or {
-        dependency: importlib.metadata.version(dependency)
-        for dependency in SOLVER_VERSIONS
-    }
-    if dict(versions) != SOLVER_VERSIONS:
-        message = f"Unexpected solver dependency closure: {dict(versions)!r}"
         raise RuntimeError(message)
 
 

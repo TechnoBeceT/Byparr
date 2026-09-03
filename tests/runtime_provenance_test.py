@@ -47,23 +47,39 @@ def test_shipped_environment_launches_geoip_browser_as_uid_1000() -> None:
 
 
 @pytest.mark.parametrize(
-    ("dependency", "version"),
+    ("dependency", "declaration", "version"),
     [
-        ("playwright", "1.58.0"),
-        ("playwright-captcha", "0.1.1"),
-        ("apify-fingerprint-datapoints", "0.10.0"),
+        ("camoufox", "camoufox[geoip]==0.4.11", "0.4.11"),
+        ("playwright", "playwright==1.58.0", "1.58.0"),
+        ("playwright-captcha", "playwright-captcha==0.1.1", "0.1.1"),
+        (
+            "apify-fingerprint-datapoints",
+            "apify-fingerprint-datapoints==0.10.0",
+            "0.10.0",
+        ),
     ],
 )
 def test_solver_dependency_closure_is_exactly_pinned(
-    dependency: str, version: str
+    dependency: str, declaration: str, version: str
 ) -> None:
     """The Python solver dependency closure matches the known working runtime."""
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text()
     lock = (PROJECT_ROOT / "uv.lock").read_text()
 
-    assert f'"{dependency}=={version}"' in pyproject
+    assert f'"{declaration}"' in pyproject
     assert f'name = "{dependency}"' in lock
     assert f'version = "{version}"' in lock
+
+
+def test_python_runtime_is_exactly_pinned_for_build_and_metadata() -> None:
+    """The image and project metadata select the proven interpreter patch."""
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text()
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text()
+    lock = (PROJECT_ROOT / "uv.lock").read_text()
+
+    assert "ARG PYTHON_VERSION=3.14.2" in dockerfile
+    assert 'requires-python = "==3.14.2"' in pyproject
+    assert 'requires-python = "==3.14.2"' in lock
 
 
 def test_runtime_verifier_rejects_wrong_browser_identity(tmp_path: Path) -> None:
@@ -80,6 +96,31 @@ def test_runtime_verifier_rejects_wrong_browser_identity(tmp_path: Path) -> None
             browser_dir=browser_dir,
             geoip_database=tmp_path / "missing.mmdb",
             installed_versions={
+                "camoufox": "0.4.11",
+                "playwright": "1.58.0",
+                "playwright-captcha": "0.1.1",
+                "apify-fingerprint-datapoints": "0.10.0",
+            },
+        )
+
+
+def test_runtime_verifier_rejects_wrong_python_version() -> None:
+    """The verifier rejects an interpreter outside the proven runtime."""
+    with pytest.raises(RuntimeError, match="Python runtime version"):
+        verify_runtime(
+            browser_dir=Path("/unused"),
+            python_version="3.14.3",
+        )
+
+
+def test_runtime_verifier_rejects_wrong_camoufox_package_version() -> None:
+    """The verifier rejects drift in the Camoufox Python package."""
+    with pytest.raises(RuntimeError, match="solver dependency closure"):
+        verify_runtime(
+            browser_dir=Path("/unused"),
+            python_version="3.14.2",
+            installed_versions={
+                "camoufox": "0.4.12",
                 "playwright": "1.58.0",
                 "playwright-captcha": "0.1.1",
                 "apify-fingerprint-datapoints": "0.10.0",
@@ -113,6 +154,7 @@ def test_runtime_verifier_accepts_the_proven_runtime_closure(
         browser_dir=browser_dir,
         geoip_database=geoip_database,
         installed_versions={
+            "camoufox": "0.4.11",
             "playwright": "1.58.0",
             "playwright-captcha": "0.1.1",
             "apify-fingerprint-datapoints": "0.10.0",
@@ -147,6 +189,7 @@ def test_runtime_verifier_rejects_wrong_geoip_database(
             browser_dir=browser_dir,
             geoip_database=geoip_database,
             installed_versions={
+                "camoufox": "0.4.11",
                 "playwright": "1.58.0",
                 "playwright-captcha": "0.1.1",
                 "apify-fingerprint-datapoints": "0.10.0",

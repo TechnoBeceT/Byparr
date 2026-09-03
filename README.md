@@ -60,8 +60,9 @@ when its page, context, or browser closes unexpectedly.
 
 Challenge detection and solving are separate checks. Byparr uses the
 dependency's Cloudflare marker selectors to detect an interstitial, delegates
-the browser interaction to `ClickSolver`, and then verifies that the marker is
-still absent before reporting success.
+the browser interaction to `ClickSolver`, and treats its successful return as
+authoritative. Bootstrap challenge markup can remain in the resulting page even
+after Cloudflare accepts the browser.
 
 ## Usage
 

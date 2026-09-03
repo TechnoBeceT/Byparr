@@ -1,9 +1,10 @@
 # Ubuntu is required by playwright.
-# Pin to 24.04 LTS: ubuntu:latest floats to 26.04, which Playwright 1.60
+# Pin to 24.04 LTS: ubuntu:latest floats to 26.04, which Playwright 1.58
 # cannot install firefox deps for (no libgtk-3 -> camoufox fails to launch).
 FROM ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea AS base
 
 ARG GITHUB_BUILD=false
+ARG PYTHON_VERSION=3.14.2
 
 ENV GITHUB_BUILD=${GITHUB_BUILD}\
     PYTHONUNBUFFERED=1 \
@@ -40,7 +41,8 @@ ARG GEOIP_DATABASE_URL=https://github.com/P3TERX/GeoLite.mmdb/releases/download/
 ARG GEOIP_DATABASE_SHA256=95285372ac03ebd0acd1d3fcf0832ffd142e8e0c4b6e8856bb5aa9c47844e539
 COPY pyproject.toml uv.lock ./
 RUN mkdir -p /cache &&\
-    uv sync &&\
+    uv python install "$PYTHON_VERSION" &&\
+    uv sync --locked --python "$PYTHON_VERSION" &&\
     curl -fL --retry 3 -o /tmp/GeoLite2-City.mmdb "$GEOIP_DATABASE_URL" &&\
     echo "$GEOIP_DATABASE_SHA256  /tmp/GeoLite2-City.mmdb" | sha256sum -c - &&\
     install -m 0444 /tmp/GeoLite2-City.mmdb /app/.venv/lib/python3.14/site-packages/camoufox/GeoLite2-City.mmdb &&\
