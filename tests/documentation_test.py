@@ -9,6 +9,7 @@ def test_public_documentation_matches_direct_only_browser_contract() -> None:
     """Public guidance must not advertise unsupported proxy behavior."""
     readme = (PROJECT_ROOT / "README.md").read_text()
     rendered_text = " ".join(readme.split())
+    agents = " ".join((PROJECT_ROOT / "AGENTS.md").read_text().split())
 
     assert (
         "`PROXY_SERVER`, `PROXY_USERNAME`, and `PROXY_PASSWORD` remain accepted "
@@ -22,8 +23,14 @@ def test_public_documentation_matches_direct_only_browser_contract() -> None:
     assert BrowserFactory.__doc__ == (
         "Open direct Camoufox resources and reject proxies before browser startup."
     )
+    assert "Every configured proxy fails before Camoufox starts." in agents
+    assert (
+        "Proxy environment variables and request headers remain parseable for "
+        "compatibility, but proxy operation is unsupported." in agents
+    )
 
     stale_claims = (
+        "resolved proxy settings",
         "Proxy Recommendation",
         "ProxyBase",
         "affiliate",
@@ -33,4 +40,9 @@ def test_public_documentation_matches_direct_only_browser_contract() -> None:
         "work seamlessly with Byparr",
         "improve your success rate",
     )
-    assert not any(claim.lower() in rendered_text.lower() for claim in stale_claims)
+    public_docs = (rendered_text, agents)
+    assert not any(
+        claim.lower() in document.lower()
+        for claim in stale_claims
+        for document in public_docs
+    )

@@ -9,7 +9,7 @@
 ## Architecture and data flow
 
 - Request flow: POST /v1 -> SessionManager/disposable acquisition -> read_item() -> page.goto() -> detect the interstitial -> ClickSolver interaction -> return LinkResponse. A successful solver return is authoritative even when bootstrap marker markup remains.
-- BrowserFactory opens AsyncCamoufox and a page-bound ClickSolver as one resource. SessionManager exclusively owns retained resources, serializes use per isolation key, and evicts resources after fatal browser closure.
+- BrowserFactory directly constructs AsyncCamoufox and opens a page-bound ClickSolver as one resource. Every configured proxy fails before Camoufox starts. SessionManager exclusively owns retained resources, serializes use per isolation key, and evicts resources after fatal browser closure.
 - Challenge detection requires both playwright_captcha's Cloudflare indicator selectors and the standard interstitial title; after detection, successful completion is the ClickSolver return rather than marker disappearance.
 - Challenge-free navigation returns once DOM content is captured; only a detected-and-solved interstitial performs the post-solver network-idle wait.
 - Health check hits /v1 internally with <https://google.com> and fails if status is not OK.
@@ -19,11 +19,12 @@
 
 - Models use Pydantic v2 with camelCase aliasing for responses (see src/models.py).
 - LinkResponse.invalid() is the standard error response shape; keep fields consistent with FlareSolverr style.
-- BrowserFactory constructs AsyncCamoufox with the required addon and resolved proxy settings, and enters ClickSolver for the same resource lifetime.
+- BrowserFactory supports direct browser construction and enters ClickSolver for the same resource lifetime.
 
 ## Config and environment
 
 - Core env vars in src/consts.py: HOST, PORT, PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD, LOG_LEVEL, VERSION.
+- Proxy environment variables and request headers remain parseable for compatibility, but proxy operation is unsupported.
 - VERSION strips leading "v" for tag-style values.
 
 ## Developer workflows
