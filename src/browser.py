@@ -152,11 +152,12 @@ class BrowserFactory:
 
     async def open(self, proxy: ProxySettings) -> BrowserResource:
         """Enter a browser scope and create a context and page within it."""
+        fingerprint_ip = proxy.fingerprint_ip
         scope = self._playwright_factory(
             main_world_eval=True,
             addons=[ADDON_PATH],
             exclude_addons=[DefaultAddons.UBO],
-            geoip=False,
+            geoip=str(fingerprint_ip) if fingerprint_ip is not None else False,
             headless=True,
             proxy=proxy.as_playwright_proxy(),
             humanize=True,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
+import warnings
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractAsyncContextManager
 from typing import Any, cast
@@ -11,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from camoufox import DefaultAddons, launch_options
+from camoufox.warnings import LeakWarning
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import BrowserContext, Page
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
@@ -173,6 +176,19 @@ def make_factory(
     )
 
 
+def generated_camoufox_config(options: dict[str, Any]) -> dict[str, object]:
+    env = cast("dict[str, object]", options["env"])
+    chunks = sorted(
+        (
+            int(name.removeprefix("CAMOU_CONFIG_")),
+            str(value),
+        )
+        for name, value in env.items()
+        if name.startswith("CAMOU_CONFIG_")
+    )
+    return cast("dict[str, object]", json.loads("".join(value for _, value in chunks)))
+
+
 @pytest.mark.asyncio
 async def test_browser_factory_owns_camoufox_solver_for_resource_lifetime() -> None:
     context = FakeContext()
@@ -220,6 +236,74 @@ async def test_browser_factory_launch_avoids_public_ip_discovery(
         launch_options(**browser_options)
     finally:
         await resource.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_factory_spoofs_nonlocal_proxy_without_ip_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured public proxy must not leak direct network fingerprint data."""
+    context = FakeContext()
+    scope = FakePlaywrightScope(FakeBrowser(context=context))
+    browser_options: dict[str, object] = {}
+    proxy = ProxySettings("http://8.8.8.8:8080", "user", "password")
+    resource = await make_factory(scope, browser_options=browser_options).open(proxy)
+
+    def reject_public_ip(_proxy: str | None = None) -> str:
+        pytest.fail("Proxy launch attempted public IP discovery")
+
+    monkeypatch.setattr("camoufox.utils.public_ip", reject_public_ip)
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", LeakWarning)
+            options = launch_options(**browser_options)
+    finally:
+        await resource.close()
+
+    config = generated_camoufox_config(options)
+    geolocation_keys = {
+        "geolocation:latitude",
+        "geolocation:longitude",
+        "timezone",
+    }
+    assert {
+        "leak_warnings": [
+            str(warning.message)
+            for warning in caught
+            if issubclass(warning.category, LeakWarning)
+        ],
+        "webrtc_ipv4": config.get("webrtc:ipv4"),
+        "geolocation_keys": geolocation_keys.intersection(config),
+        "proxy": options["proxy"],
+    } == {
+        "leak_warnings": [],
+        "webrtc_ipv4": "8.8.8.8",
+        "geolocation_keys": geolocation_keys,
+        "proxy": proxy.as_playwright_proxy(),
+    }
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        "http://proxy.example:8080",
+        "http://127.0.0.1:8080",
+        "http://192.0.2.1:8080",
+    ],
+)
+def test_proxy_fingerprint_fails_closed_without_public_ip_literal(
+    server: str,
+) -> None:
+    """Offline proxy fingerprinting must reject ambiguous endpoint addresses."""
+    proxy = ProxySettings(server, "private-user", "private-password")
+
+    with pytest.raises(ValueError, match="public IP literal") as exc:
+        _ = proxy.fingerprint_ip
+
+    rendered = str(exc.value)
+    assert server not in rendered
+    assert "private-user" not in rendered
+    assert "private-password" not in rendered
 
 
 @pytest.mark.asyncio

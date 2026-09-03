@@ -7,8 +7,13 @@ import json
 import secrets
 from dataclasses import dataclass
 from hashlib import sha256
+from ipaddress import IPv4Address, IPv6Address, ip_address
+from urllib.parse import urlsplit
 
 _PROXY_IDENTITY_KEY = secrets.token_bytes(32)
+_PROXY_FINGERPRINT_ERROR = (
+    "Proxy fingerprinting requires a public IP literal in the proxy server"
+)
 
 
 @dataclass(frozen=True, repr=False)
@@ -39,6 +44,20 @@ class ProxySettings:
         ).encode()
         digest = hmac.new(_PROXY_IDENTITY_KEY, material, sha256).hexdigest()
         return f"proxy:{digest}"
+
+    @property
+    def fingerprint_ip(self) -> IPv4Address | IPv6Address | None:
+        """Return a public proxy endpoint IP without DNS or HTTP discovery."""
+        if self.server is None:
+            return None
+        try:
+            hostname = urlsplit(self.server).hostname or ""
+            address = ip_address(hostname)
+        except ValueError:
+            raise ValueError(_PROXY_FINGERPRINT_ERROR) from None
+        if not address.is_global or "%" in hostname:
+            raise ValueError(_PROXY_FINGERPRINT_ERROR)
+        return address
 
     def as_playwright_proxy(self) -> dict[str, str | None] | None:
         """Return the proxy format accepted by Camoufox."""
