@@ -37,8 +37,8 @@ RUN mkdir -p /cache/camoufox &&\
 FROM browser AS app
 WORKDIR /app
 
-ARG GEOIP_DATABASE_URL=https://github.com/P3TERX/GeoLite.mmdb/releases/download/2026.09.01/GeoLite2-City.mmdb
-ARG GEOIP_DATABASE_SHA256=95285372ac03ebd0acd1d3fcf0832ffd142e8e0c4b6e8856bb5aa9c47844e539
+ARG GEOIP_DATABASE_URL=https://github.com/P3TERX/GeoLite.mmdb/releases/download/2026.10.04/GeoLite2-City.mmdb
+ARG GEOIP_DATABASE_SHA256=ffedb2751cae16fdd886814a6c8480633c915ec136c1582ca5c9fc5861f781aa
 COPY pyproject.toml uv.lock ./
 RUN mkdir -p /cache &&\
     uv python install "$PYTHON_VERSION" &&\

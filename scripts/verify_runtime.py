@@ -21,7 +21,7 @@ SOLVER_VERSIONS = {
     "apify-fingerprint-datapoints": "0.10.0",
 }
 GEOIP_DATABASE_SHA256 = (
-    "95285372ac03ebd0acd1d3fcf0832ffd142e8e0c4b6e8856bb5aa9c47844e539"
+    "ffedb2751cae16fdd886814a6c8480633c915ec136c1582ca5c9fc5861f781aa"
 )
 
 
