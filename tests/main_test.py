@@ -420,7 +420,10 @@ class RejectingSessionManager:
     """Model a saturated retained-session manager at the HTTP boundary."""
 
     @asynccontextmanager
-    async def acquire(self, _key: object, _proxy: object):
+    async def acquire(
+        self, _key: object, _proxy: object, *, generation: str | None = None
+    ):
+        assert generation is None
         raise SessionCapacityError
         yield  # pragma: no cover
 
@@ -433,7 +436,10 @@ class RecordingSessionManager:
         self.acquire_calls = 0
 
     @asynccontextmanager
-    async def acquire(self, _key: object, _proxy: object):
+    async def acquire(
+        self, _key: object, _proxy: object, *, generation: str | None = None
+    ):
+        assert generation is None
         self.acquire_calls += 1
         raise AssertionError("session command must not acquire a browser")
         yield  # pragma: no cover

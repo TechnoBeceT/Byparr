@@ -119,6 +119,7 @@ async def get_request_browser(
     x_proxy_server: str | None = None,
     x_proxy_username: str | None = None,
     x_proxy_password: str | None = None,
+    generation: str | None = None,
 ) -> AsyncGenerator[BrowserDepClass]:
     """Acquire a disposable or retained browser for a FlareSolverr request."""
     proxy = resolve_proxy_settings(
@@ -140,7 +141,7 @@ async def get_request_browser(
     if manager is None:
         raise RuntimeError(SESSION_LIFESPAN_REQUIRED_MESSAGE)
     try:
-        async with manager.acquire(key, proxy) as browser:
+        async with manager.acquire(key, proxy, generation=generation) as browser:
             try:
                 yield browser
             except BaseException as error:

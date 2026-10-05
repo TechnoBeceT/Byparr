@@ -102,3 +102,15 @@ class ClaimDecision:
     result: SessionEntry | None = None
     event: str | None = None
     capacity_rejected: bool = False
+
+
+@dataclass
+class RecoveryFence:
+    """Opaque process-lifetime arrival fence, retained after browser eviction."""
+
+    generation: str
+    managed: bool = True
+    previous: str | None = None
+    ready: bool = True
+    failure: BaseException | None = None
+    task: asyncio.Task[str] | None = None

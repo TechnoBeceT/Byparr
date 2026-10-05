@@ -12,13 +12,22 @@ from src import consts
 
 MS_PER_SECOND = 1000
 SESSION_PRINTABLE_MESSAGE = "session must contain printable characters only"
+SESSION_GENERATION_REQUIRED_MESSAGE = (
+    "sessionGeneration is required for confirmed recovery"
+)
 SESSION_REQUIRED_MESSAGE = "session is required for session commands"
 
 
 class LinkRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
-    cmd: Literal["request.get", "sessions.create", "sessions.destroy"] = Field(
+    cmd: Literal[
+        "request.get",
+        "sessions.create",
+        "sessions.destroy",
+        "sessions.recovery.prepare",
+        "sessions.recovery.confirm",
+    ] = Field(
         default="request.get",
         description="FlareSolverr-compatible request or session command.",
     )
@@ -48,6 +57,10 @@ class LinkRequest(BaseModel):
         description="Optional FlareSolverr-compatible session name.",
     )
 
+    session_generation: str | None = Field(
+        default=None, alias="sessionGeneration", pattern=r"^[0-9a-f]{32}$"
+    )
+
     @field_validator("session", mode="before")
     @classmethod
     def normalize_session(cls, value: object) -> object:
@@ -74,6 +87,8 @@ class LinkRequest(BaseModel):
         """Require the normalized session name for non-navigation commands."""
         if self.cmd != "request.get" and self.session is None:
             raise ValueError(SESSION_REQUIRED_MESSAGE)
+        if self.cmd == "sessions.recovery.confirm" and self.session_generation is None:
+            raise ValueError(SESSION_GENERATION_REQUIRED_MESSAGE)
         return self
 
 
@@ -129,3 +144,13 @@ class SessionResponse(BaseModel):
     start_timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
     end_timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
     version: str = consts.VERSION
+
+
+class RecoveryResponse(BaseModel):
+    """Versioned acknowledgment of exact-name arrival fencing and browser closure."""
+
+    protocol: Literal["fenced-drain-close-v1"] = "fenced-drain-close-v1"
+    session: str
+    generation: str
+    previous_generation: str | None = Field(default=None, alias="previousGeneration")
+    outcome: Literal["prepared", "drained-closed"]

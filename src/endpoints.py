@@ -19,9 +19,11 @@ from src.models import (
     HealthcheckResponse,
     LinkRequest,
     LinkResponse,
+    RecoveryResponse,
     SessionResponse,
     Solution,
 )
+from src.sessions import SessionManager, SessionResetError
 from src.utils import (
     BrowserDepClass,
     TimeoutTimer,
@@ -130,16 +132,32 @@ async def read_item(request: LinkRequest, dep: BrowserDepClass) -> LinkResponse:
         )
 
 
-@router.post("/v1", response_model_exclude_none=True)
-async def handle_v1(
-    request: LinkRequest,
-    app_request: Request,
-    x_proxy_server: Annotated[str | None, Header(alias="X-Proxy-Server")] = None,
-    x_proxy_username: Annotated[str | None, Header(alias="X-Proxy-Username")] = None,
-    x_proxy_password: Annotated[str | None, Header(alias="X-Proxy-Password")] = None,
-) -> LinkResponse | SessionResponse:
-    """Select the request browser lifecycle before running navigation."""
-    start_time = int(time.time() * 1000)
+async def session_command(
+    request: LinkRequest, manager: SessionManager, start_time: int
+) -> SessionResponse | RecoveryResponse:
+    """Dispatch browser lifecycle commands without admitting navigation."""
+    if request.cmd.startswith("sessions.recovery."):
+        assert request.session is not None
+        try:
+            if request.cmd == "sessions.recovery.prepare":
+                generation = await manager.prepare_recovery(request.session)
+                return RecoveryResponse(
+                    session=request.session, generation=generation, outcome="prepared"
+                )
+            assert request.session_generation is not None
+            generation = await manager.confirm_recovery(
+                request.session, request.session_generation
+            )
+            return RecoveryResponse(
+                session=request.session,
+                generation=generation,
+                previousGeneration=request.session_generation,
+                outcome="drained-closed",
+            )
+        except SessionResetError as error:
+            raise HTTPException(
+                status_code=409, detail="Session recovery generation unavailable"
+            ) from error
     if request.cmd == "sessions.create":
         assert request.session is not None
         return SessionResponse(
@@ -149,9 +167,45 @@ async def handle_v1(
         )
     if request.cmd == "sessions.destroy":
         assert request.session is not None
-        await app_request.app.state.session_manager.reset(request.session)
+        try:
+            await manager.reset(request.session)
+        except SessionResetError as error:
+            raise HTTPException(
+                status_code=409, detail="Session requires confirmed recovery"
+            ) from error
         return SessionResponse(
             message="The session has been removed.", start_timestamp=start_time
+        )
+    raise HTTPException(status_code=400, detail="Unsupported session command")
+
+
+@router.get("/v1/session-recovery")
+def recovery_capability() -> dict[str, str]:
+    """Advertise explicit support for fenced, confirmed session recreation."""
+    return {"protocol": "fenced-drain-close-v1"}
+
+
+@router.post("/v1", response_model_exclude_none=True)
+async def handle_v1(
+    request: LinkRequest,
+    app_request: Request,
+    *,
+    x_proxy_server: Annotated[str | None, Header(alias="X-Proxy-Server")] = None,
+    x_proxy_username: Annotated[str | None, Header(alias="X-Proxy-Username")] = None,
+    x_proxy_password: Annotated[str | None, Header(alias="X-Proxy-Password")] = None,
+    x_session_generation: Annotated[
+        str | None, Header(alias="X-Byparr-Session-Generation")
+    ] = None,
+) -> LinkResponse | SessionResponse | RecoveryResponse:
+    """Select the request browser lifecycle before running navigation."""
+    start_time = int(time.time() * 1000)
+    if x_session_generation is not None and request.session is None:
+        raise HTTPException(
+            status_code=409, detail="Generation requires a named session"
+        )
+    if request.cmd != "request.get":
+        return await session_command(
+            request, app_request.app.state.session_manager, start_time
         )
     try:
         async with get_request_browser(
@@ -160,8 +214,14 @@ async def handle_v1(
             x_proxy_server=x_proxy_server,
             x_proxy_username=x_proxy_username,
             x_proxy_password=x_proxy_password,
+            generation=x_session_generation,
         ) as dep:
             return await read_item(request, dep)
+    except SessionResetError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Session generation rejected before browser acquisition",
+        ) from error
     except HTTPException:
         raise
     except PlaywrightError as error:

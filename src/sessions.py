@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager, suppress
 from typing import cast
@@ -17,6 +18,7 @@ from src._session_state import (
     AdmissionReservation,
     ClaimDecision,
     OpenResult,
+    RecoveryFence,
     SessionCapacityError,
     SessionEntry,
     SessionLifecycleTimeoutError,
@@ -37,6 +39,7 @@ from src.consts import (
 from src.proxy import ProxySettings
 from src.session_key import SessionKey
 
+_RECOVERY_FENCE_CAPACITY = 128
 _CLOSED_MESSAGE = "session manager is closed"
 _TTL_MIN_MESSAGE = "ttl_seconds must be at least 1"
 _CAPACITY_MIN_MESSAGE = "max_sessions must be at least 1"
@@ -75,19 +78,25 @@ class SessionManager:
         self._session_acquisitions: dict[str, int] = {}
         self._map_lock = asyncio.Lock()
         self._touch_order = 0
+        self._recovery_fences: dict[str, RecoveryFence] = {}
+        self._recovery_history_full = False
         self._closed = False
         self._shutdown_task: asyncio.Task[BaseException | None] | None = None
 
     @asynccontextmanager
     async def acquire(
-        self, key: SessionKey, proxy: ProxySettings
+        self, key: SessionKey, proxy: ProxySettings, *, generation: str | None = None
     ) -> AsyncGenerator[BrowserDepClass]:
         """Lease the retained browser for one key, creating it only once."""
         if key.proxy_id != proxy.identity:
             raise SessionProxyMismatchError
-        generation = await self._register_acquisition(key.session)
+        registered_generation = await self._register_acquisition(
+            key.session, generation
+        )
         try:
-            async with self._acquire_registered(key, proxy, generation) as browser:
+            async with self._acquire_registered(
+                key, proxy, registered_generation
+            ) as browser:
                 yield browser
         finally:
             cleanup = asyncio.create_task(self._unregister_acquisition(key.session))
@@ -140,9 +149,15 @@ class SessionManager:
             if retry:
                 await self._wait_for_event(entry.retired, key, "replacement")
 
-    async def reset(self, session: str) -> int:
+    async def reset(self, session: str, *, _confirmed: bool = False) -> int:
         """Retire every site and proxy entry for one exact normalized session."""
         async with self._map_lock:
+            if (
+                self._recovery_fences.get(session) is not None
+                and self._recovery_fences[session].managed
+                and not _confirmed
+            ):
+                raise SessionResetError
             entries = [
                 entry for entry in self._owned.values() if entry.key.session == session
             ]
@@ -173,6 +188,73 @@ class SessionManager:
         if error is not None:
             raise error
         return len(keys)
+
+    async def prepare_recovery(self, session: str) -> str:
+        """Enable arrival fencing without closing or replacing a healthy browser."""
+        async with self._map_lock:
+            if self._closed:
+                raise RuntimeError(_CLOSED_MESSAGE)
+            fence = self._recovery_fences.get(session)
+            if fence is None:
+                if self._recovery_history_full:
+                    raise SessionResetError
+                if len(self._recovery_fences) >= _RECOVERY_FENCE_CAPACITY:
+                    raise SessionCapacityError
+                fence = RecoveryFence(generation=uuid.uuid4().hex)
+                self._recovery_fences[session] = fence
+            if not fence.ready or fence.failure is not None:
+                raise SessionResetError
+            return fence.generation
+
+    async def confirm_recovery(self, session: str, generation: str) -> str:
+        """Fence old arrivals, then acknowledge only drained and closed ownership."""
+        async with self._map_lock:
+            fence = self._recovery_fences.get(session)
+            if (
+                fence is None
+                or not fence.managed
+                or generation not in (fence.generation, fence.previous)
+            ):
+                raise SessionResetError
+            if fence.failure is not None:
+                raise fence.failure
+            if fence.task is None or (
+                fence.task.done() and generation == fence.generation
+            ):
+                fence.previous = fence.generation
+                fence.generation = uuid.uuid4().hex
+                fence.ready = False
+                fence.task = asyncio.create_task(self._confirm_recovery(session, fence))
+                fence.task.add_done_callback(self._consume_recovery_result)
+            elif generation != fence.previous:
+                raise SessionResetError
+            task = fence.task
+        return await asyncio.shield(task)
+
+    @staticmethod
+    def _consume_recovery_result(task: asyncio.Task[str]) -> None:
+        """Observe detached completion while retaining failure on its fence."""
+        if not task.cancelled():
+            task.exception()
+
+    async def _confirm_recovery(self, session: str, fence: RecoveryFence) -> str:
+        """Own cleanup independently of a disconnected confirmation caller."""
+        try:
+            await self.reset(session, _confirmed=True)
+            async with self._map_lock:
+                self._require_recovery_healthy(fence)
+                fence.ready = True
+                return fence.generation
+        except BaseException as error:
+            async with self._map_lock:
+                fence.failure = error
+            raise
+
+    @staticmethod
+    def _require_recovery_healthy(fence: RecoveryFence) -> None:
+        """Refuse acknowledgment if any matching creation or close failed."""
+        if fence.failure is not None:
+            raise fence.failure
 
     async def expire_idle(self) -> int:
         """Retire entries idle for at least the configured monotonic TTL."""
@@ -350,6 +432,8 @@ class SessionManager:
                 self._schedule_retirement_locked(entry)
                 snapshot = self._snapshot_locked()
             error = SessionLifecycleTimeoutError()
+            async with self._map_lock:
+                self._record_recovery_failure_locked(entry.key.session, error)
             log_session_event(
                 logging.WARNING,
                 "timeout",
@@ -360,7 +444,7 @@ class SessionManager:
             )
             return OpenResult(error=error)
         except BaseException as error:
-            await self._terminalize_entry(entry, None)
+            await self._terminalize_entry(entry, error)
             return OpenResult(error=error)
         async with self._map_lock:
             entry.resource = resource
@@ -383,9 +467,24 @@ class SessionManager:
             event = "idle" if entry.claims == 0 else "busy"
         log_session_event(logging.DEBUG, event, entry.key, snapshot=snapshot)
 
-    async def _register_acquisition(self, session: str) -> int:
+    async def _register_acquisition(
+        self, session: str, generation: str | None = None
+    ) -> int:
         """Publish a reset-fence observer before an acquisition can be reset."""
         async with self._map_lock:
+            fence = self._recovery_fences.get(session)
+            if (
+                fence is not None
+                and fence.managed
+                and (
+                    not fence.ready
+                    or fence.failure is not None
+                    or generation != fence.generation
+                )
+            ):
+                raise SessionResetError
+            if (fence is None or not fence.managed) and generation is not None:
+                raise SessionResetError
             self._session_acquisitions[session] = (
                 self._session_acquisitions.get(session, 0) + 1
             )
@@ -518,9 +617,25 @@ class SessionManager:
             if self._barriers.get(entry.key) is entry:
                 self._barriers.pop(entry.key)
             self._owned.pop(id(entry), None)
+            if error is not None:
+                self._record_recovery_failure_locked(entry.key.session, error)
             entry.terminal_error = error
             entry.retired.set()
             self._drop_generation_locked(entry.key.session)
+
+    def _record_recovery_failure_locked(
+        self, session: str, error: BaseException
+    ) -> None:
+        """Keep exact-name failure evidence even after ownership leaves the map."""
+        fence = self._recovery_fences.get(session)
+        if fence is None:
+            if len(self._recovery_fences) >= _RECOVERY_FENCE_CAPACITY:
+                self._recovery_history_full = True
+                return
+            fence = RecoveryFence(generation=uuid.uuid4().hex, managed=False)
+            self._recovery_fences[session] = fence
+        fence.failure = error
+        fence.ready = False
 
     async def _begin_shutdown(
         self,

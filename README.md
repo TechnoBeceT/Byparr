@@ -199,6 +199,53 @@ Sessions survive requests but never process or container restarts. Session
 names, cookie values, and proxy credentials are not persisted, and they are
 not logged in plaintext.
 
+### Confirmed named-session recovery
+
+`GET /v1/session-recovery` advertises `{"protocol":"fenced-drain-close-v1"}`.
+Clients must verify this explicit capability before using automatic recovery.
+An unsupported solver requires manual recovery with verified remote termination
+or browser recreation; a generic `sessions.destroy` success, HTTP status,
+socket closure or elapsed timeout does not prove that old requests have drained.
+
+Prepare a named session by posting
+`{"cmd":"sessions.recovery.prepare","session":"my-account"}` to `/v1`.
+The response contains `protocol`, `session`, a 32-character lowercase hexadecimal
+`generation`, and `outcome: "prepared"`. Prepare enables arrival fencing without
+closing a healthy browser or losing its cookies. Send that generation in the
+`X-Byparr-Session-Generation` header on subsequent `request.get` calls. Once
+prepared, untagged requests and requests carrying an obsolete generation are
+rejected before browser acquisition. The session name retains the normalization
+described above; clients must validate the acknowledged name rather than silently
+changing their configured identity.
+
+After an ambiguous solve failure, post
+`{"cmd":"sessions.recovery.confirm","session":"my-account","sessionGeneration":"<generation>"}`
+to `/v1`. Confirmation fences old arrivals, waits for all previously admitted
+work under that name to drain, and closes its browser resources. Only successful
+completion returns `outcome: "drained-closed"`, the matching `protocol` and
+`session`, the submitted `previousGeneration`, and a distinct new `generation`.
+Validate all these fields before using the replacement generation. The next
+matching solve creates a fresh browser lazily under the same name. Delayed
+requests with the old generation cannot enter that replacement. Generic
+`sessions.destroy` is refused for a prepared name and cannot replace confirmation.
+
+Confirmation resets every browser entry sharing that exact normalized name,
+across all site and proxy isolation keys. **All cookies and browser state for
+those entries are lost**, including state for sites other than the failed one.
+Use confirmation only when this loss is acceptable. It does not change the
+configured session name, target or proxy/egress selection, and does not enable
+unsupported proxy launches.
+
+A disconnected confirmation caller does not stop server-owned cleanup.
+Creation or close failures prevent acknowledgement and keep the name unresolved;
+malformed or mismatched acknowledgements must likewise never authorize reuse.
+There is no timeout-based unblock or fallback to an untagged solve. Recovery
+fences are bounded to 128 distinct names per server process and retained to
+reject delayed arrivals; they are separate from the browser-context capacity.
+They are not durable across restart, so restarting the service does not establish
+remote completion or substitute for coordinated recovery.
+
+
 ### Open WebUI Integration
 
 Byparr can serve as an external web loader for [Open WebUI](https://github.com/open-webui/open-webui), allowing it to fetch web content through Byparr's anti-bot bypassing capabilities.
